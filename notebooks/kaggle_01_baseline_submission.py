@@ -116,57 +116,75 @@ model.eval()
 print("Model loaded.")
 
 
-# ── CELL 6 — Transcribe every test audio file ───────────────────────────────
-# NOTE: we do NOT force a language — this is a unified multilingual model,
-# the test set gives no language label, so we let Whisper auto-detect.
-# Swahili is in Whisper's pretraining; the other 5 languages are not, so
-# expect high WER on those — that's exactly the gap fine-tuning will close.
+# ── CELL 6 — Transcribe every test audio (audio embedded in parquet bytes) ──
+# The test set stores audio as bytes inside each parquet row — no separate
+# audio files exist on disk. We read every parquet, decode the 'audio' column
+# bytes with soundfile, and transcribe via HF pipeline which handles clips
+# longer than 30 sec by chunking automatically.
+# Expect ~2-4 hours for ~40 000 clips on GPU T4 x2.
 
-def transcribe(audio_path_or_array, sr=None):
-    if isinstance(audio_path_or_array, str):
-        audio_array, sr = sf.read(audio_path_or_array, dtype="float32")
-        if audio_array.ndim > 1:
-            audio_array = audio_array.mean(axis=1)
-    else:
-        audio_array = audio_path_or_array
+from transformers import pipeline as hf_pipeline
 
-    inputs = processor(audio_array, sampling_rate=16_000, return_tensors="pt")
-    input_features = inputs.input_features.to(device)
-    with torch.no_grad():
-        predicted_ids = model.generate(input_features, max_new_tokens=225)
-    text = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
-    return text.strip()
+pipe = hf_pipeline(
+    "automatic-speech-recognition",
+    model=model,
+    tokenizer=processor.tokenizer,
+    feature_extractor=processor.feature_extractor,
+    device=0 if torch.cuda.is_available() else -1,
+    chunk_length_s=30,   # clips can be 3+ minutes — split into 30 s chunks
+    stride_length_s=5,   # 5 s overlap between chunks for smoother joins
+)
+
+def decode_audio_bytes(audio_field):
+    """Convert parquet audio field (dict with 'bytes') to numpy array at 16 kHz.
+    Primary: soundfile (WAV/FLAC). Fallback: pydub via ffmpeg (webm/mp3/opus/aac).
+    """
+    import numpy as np
+    raw = audio_field["bytes"] if isinstance(audio_field, dict) else bytes(audio_field)
+    try:
+        arr, sr = sf.read(io.BytesIO(raw), dtype="float32")
+        if arr.ndim > 1:
+            arr = arr.mean(axis=1)
+        if sr != 16_000:
+            import librosa
+            arr = librosa.resample(arr, orig_sr=sr, target_sr=16_000)
+        return {"array": arr, "sampling_rate": 16_000}
+    except Exception:
+        pass
+    from pydub import AudioSegment
+    audio = AudioSegment.from_file(io.BytesIO(raw)).set_frame_rate(16_000).set_channels(1)
+    arr = np.array(audio.get_array_of_samples(), dtype=np.float32) / 32768.0
+    return {"array": arr, "sampling_rate": 16_000}
+
+all_parquet_files = sorted(
+    glob.glob(os.path.join(test_path, "**", "*.parquet"), recursive=True)
+)
+print(f"Transcribing {len(all_parquet_files)} parquet files (~40 000 clips total).")
+print("This will take 2-4 hours on GPU. Progress is printed per file.\n")
 
 results = []
-if test_df is not None:
-    # Adjust these column-name guesses once Cell 4's output tells you the real names
-    id_col = next((c for c in test_df.columns if "id" in c.lower() or "path" in c.lower()), test_df.columns[0])
-    print(f"Using '{id_col}' as the file/id column. Verify this is correct!")
-
-    for i, row in test_df.iterrows():
-        file_ref = row[id_col]
-        # try to resolve to an actual file on disk
-        matches = [f for f in audio_files if os.path.basename(f).startswith(str(file_ref))
-                   or str(file_ref) in f]
-        if not matches:
-            print(f"  [{i}] WARNING: no audio file found for '{file_ref}' — skipping")
-            continue
-        hyp = transcribe(matches[0])
-        results.append({"id": file_ref, "transcription": hyp})
-        if i < 3:
-            print(f"  [{i}] {file_ref} -> {hyp}")
-else:
-    # fallback: just transcribe every audio file found directly
-    for f in audio_files:
-        hyp = transcribe(f)
-        results.append({"id": os.path.basename(f), "transcription": hyp})
+for pf_idx, pq_file in enumerate(all_parquet_files):
+    df = pd.read_parquet(pq_file)
+    lang = df["language"].iloc[0] if len(df) > 0 else "?"
+    print(f"[{pf_idx+1}/{len(all_parquet_files)}] {os.path.basename(pq_file)}  "
+          f"lang={lang}  rows={len(df)}", flush=True)
+    for _, row in df.iterrows():
+        try:
+            audio_input = decode_audio_bytes(row["audio"])
+            hyp = pipe(audio_input)["text"].strip()
+        except Exception as e:
+            hyp = ""
+            print(f"  ERROR {row['id']}: {e}")
+        results.append({"id": row["id"], "transcription": hyp})
+    print(f"  -> cumulative: {len(results)} transcriptions", flush=True)
 
 print(f"\nTotal transcriptions: {len(results)}")
 
 
 # ── CELL 7 — Build submission file ──────────────────────────────────────────
-# TODO: confirm exact column names against sample_submission.csv on Kaggle's
-# "Data" tab before submitting — this is a best guess (id, transcription).
+# Confirmed column names from test parquet inspection:
+#   id           — wav filename, e.g. "QeUUZNkacY_10Jun2025...wav"
+#   transcription — our predicted text
 submission_df = pd.DataFrame(results)
 submission_df.to_csv("submission.csv", index=False)
 print(submission_df.head())

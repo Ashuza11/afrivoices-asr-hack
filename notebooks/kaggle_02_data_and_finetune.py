@@ -299,12 +299,31 @@ LANG_TO_WHISPER_CODE = {
     # revisit (e.g. add new tokens, or drop forced language conditioning entirely).
 }
 
+def decode_audio_bytes(audio_field):
+    """Decode parquet audio field to numpy array at 16 kHz.
+    Primary: soundfile (WAV/FLAC). Fallback: pydub via ffmpeg (webm/mp3/opus/aac).
+    """
+    import numpy as np
+    raw = audio_field["bytes"] if isinstance(audio_field, dict) else bytes(audio_field)
+    try:
+        arr, sr = sf.read(io.BytesIO(raw), dtype="float32")
+        if arr.ndim > 1:
+            arr = arr.mean(axis=1)
+        if sr != 16_000:
+            arr = librosa.resample(arr, orig_sr=sr, target_sr=16_000)
+        return arr
+    except Exception:
+        pass
+    from pydub import AudioSegment
+    audio = AudioSegment.from_file(io.BytesIO(raw)).set_frame_rate(16_000).set_channels(1)
+    arr = np.array(audio.get_array_of_samples(), dtype=np.float32) / 32768.0
+    return arr
+
 def prepare_example(example):
     audio = example["audio"]
     if isinstance(audio, dict) and "bytes" in audio and audio.get("array") is None:
-        arr, sr = sf.read(io.BytesIO(audio["bytes"]), dtype="float32")
-        if arr.ndim > 1:
-            arr = arr.mean(axis=1)
+        arr = decode_audio_bytes(audio)
+        sr = 16_000
     else:
         arr, sr = audio["array"], audio["sampling_rate"]
 
