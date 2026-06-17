@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.env
+
+# Models and checkpoints (too large for git — use HuggingFace Hub)
+models/
+*.bin
+*.safetensors
+*.gguf
+*.onnx
+*.pt
+*.pth
+
+# Data files (too large for git)
+data/*.wav
+data/*.mp3
+data/*.flac
+data/*.webm
+data/*.tar.xz
+
+# Kaggle output
+submission.csv
+wandb/
+
+# Internal planning doc
+PLAN.md
+
+# OS
+.DS_Store
+Thumbs.db
