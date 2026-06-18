@@ -108,10 +108,11 @@ from transformers import WhisperProcessor, WhisperForConditionalGeneration
 
 MODEL_ID = "openai/whisper-small"
 device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Loading {MODEL_ID} on {device} ...")
+dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+print(f"Loading {MODEL_ID} on {device} ({dtype}) ...")
 
 processor = WhisperProcessor.from_pretrained(MODEL_ID)
-model = WhisperForConditionalGeneration.from_pretrained(MODEL_ID).to(device)
+model = WhisperForConditionalGeneration.from_pretrained(MODEL_ID, torch_dtype=dtype).to(device)
 model.eval()
 print("Model loaded.")
 
@@ -131,12 +132,16 @@ pipe = hf_pipeline(
     tokenizer=processor.tokenizer,
     feature_extractor=processor.feature_extractor,
     device=0 if torch.cuda.is_available() else -1,
-    chunk_length_s=30,   # clips can be 3+ minutes — split into 30 s chunks
-    stride_length_s=5,   # 5 s overlap between chunks for smoother joins
+    generate_kwargs={"task": "transcribe"},  # transcribe in source language, not translate to English
+    # return_timestamps=True is intentionally NOT set here — it breaks batching
+    # by forcing single-clip long-form mode. Test clips are ≤30s so no truncation risk.
 )
 
+BATCH_SIZE = 16  # clips processed in parallel on GPU — ~5-10x faster than one-by-one
+CHECKPOINT_FILE = "/kaggle/working/submission_checkpoint.csv"
+
 def decode_audio_bytes(audio_field):
-    """Convert parquet audio field (dict with 'bytes') to numpy array at 16 kHz.
+    """Decode parquet audio bytes → 16 kHz numpy array.
     Primary: soundfile (WAV/FLAC). Fallback: pydub via ffmpeg (webm/mp3/opus/aac).
     """
     import numpy as np
@@ -156,36 +161,79 @@ def decode_audio_bytes(audio_field):
     arr = np.array(audio.get_array_of_samples(), dtype=np.float32) / 32768.0
     return {"array": arr, "sampling_rate": 16_000}
 
+# ── Resume from checkpoint if the session was interrupted ───────────────────
+if os.path.exists(CHECKPOINT_FILE):
+    existing = pd.read_csv(CHECKPOINT_FILE)
+    results  = existing.to_dict("records")
+    done_ids = set(existing["id"])
+    print(f"Resuming from checkpoint: {len(results)} clips already done.")
+else:
+    results, done_ids = [], set()
+    print("Starting fresh.")
+
 all_parquet_files = sorted(
     glob.glob(os.path.join(test_path, "**", "*.parquet"), recursive=True)
 )
-print(f"Transcribing {len(all_parquet_files)} parquet files (~40 000 clips total).")
-print("This will take 2-4 hours on GPU. Progress is printed per file.\n")
+print(f"{len(all_parquet_files)} parquet files total. Batch size: {BATCH_SIZE}.\n")
 
-results = []
 for pf_idx, pq_file in enumerate(all_parquet_files):
     df = pd.read_parquet(pq_file)
-    lang = df["language"].iloc[0] if len(df) > 0 else "?"
+    df = df[~df["id"].isin(done_ids)]      # skip rows already transcribed
+    if len(df) == 0:
+        print(f"[{pf_idx+1}/{len(all_parquet_files)}] already done — skip")
+        continue
+    lang = df["language"].iloc[0]
     print(f"[{pf_idx+1}/{len(all_parquet_files)}] {os.path.basename(pq_file)}  "
           f"lang={lang}  rows={len(df)}", flush=True)
-    for _, row in df.iterrows():
-        try:
-            audio_input = decode_audio_bytes(row["audio"])
-            hyp = pipe(audio_input)["text"].strip()
-        except Exception as e:
-            hyp = ""
-            print(f"  ERROR {row['id']}: {e}")
-        results.append({"id": row["id"], "transcription": hyp})
-    print(f"  -> cumulative: {len(results)} transcriptions", flush=True)
 
-print(f"\nTotal transcriptions: {len(results)}")
+    rows = list(df.itertuples(index=False))
+    for i in range(0, len(rows), BATCH_SIZE):
+        chunk = rows[i : i + BATCH_SIZE]
+        batch_audio, batch_ids = [], []
+        for row in chunk:
+            try:
+                batch_audio.append(decode_audio_bytes(row.audio))
+                batch_ids.append(row.id)
+            except Exception as e:
+                print(f"  DECODE ERROR {row.id}: {e}")
+                results.append({"id": row.id, "transcription": ""})
+                done_ids.add(row.id)
+
+        if batch_audio:
+            try:
+                outputs = pipe(batch_audio, batch_size=len(batch_audio))
+                for id_, out in zip(batch_ids, outputs):
+                    results.append({"id": id_, "transcription": out["text"].strip()})
+                    done_ids.add(id_)
+            except Exception as e:
+                # batch failed — fall back to one-by-one for this chunk
+                print(f"  BATCH ERROR ({e}) — falling back to one-by-one")
+                for id_, audio in zip(batch_ids, batch_audio):
+                    try:
+                        results.append({"id": id_, "transcription": pipe(audio)["text"].strip()})
+                    except Exception:
+                        results.append({"id": id_, "transcription": ""})
+                    done_ids.add(id_)
+
+    # Save after every parquet file — if session dies, resume from here
+    pd.DataFrame(results).to_csv(CHECKPOINT_FILE, index=False)
+    print(f"  -> checkpoint saved ({len(results)} total)", flush=True)
+
+print(f"\nDone. Total: {len(results)}")
 
 
 # ── CELL 7 — Build submission file ──────────────────────────────────────────
 # Confirmed column names from test parquet inspection:
 #   id           — wav filename, e.g. "QeUUZNkacY_10Jun2025...wav"
 #   transcription — our predicted text
-submission_df = pd.DataFrame(results)
+
+# Safety: if the kernel reset after Cell 6 saved the checkpoint, load from disk
+if not results and os.path.exists(CHECKPOINT_FILE):
+    print(f"Loading results from checkpoint file: {CHECKPOINT_FILE}")
+    submission_df = pd.read_csv(CHECKPOINT_FILE)
+else:
+    submission_df = pd.DataFrame(results)
+
 submission_df.to_csv("submission.csv", index=False)
 print(submission_df.head())
 print(f"\nWrote submission.csv with {len(submission_df)} rows.")
