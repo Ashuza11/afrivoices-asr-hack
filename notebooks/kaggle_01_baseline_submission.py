@@ -1,20 +1,6 @@
 """
 Kaggle Notebook 1 — Zero-shot baseline submission
 ==================================================
-Goal: get ONE valid submission on the leaderboard today, with zero training.
-This validates the submission pipeline end-to-end before we invest in the
-heavy multilingual fine-tuning work (Notebook 2).
-
-HOW TO USE ON KAGGLE:
-  1. kaggle.com -> Create -> New Notebook
-  2. Settings (right sidebar): Accelerator = GPU T4 x2 (or P100), Internet = ON
-  3. Add-ons -> Secrets -> add HF_TOKEN (your Hugging Face token, read access)
-  4. Copy each "# ── CELL n ──" block below into its own notebook cell, in order
-  5. Run all
-
-Each cell is self-contained and prints what it found — read the printed
-output before moving to the next cell, since we don't yet know the exact
-test-set file layout or submission schema.
 """
 
 # ── CELL 1 — Install dependencies ───────────────────────────────────────────
@@ -114,37 +100,23 @@ print(f"Loading {MODEL_ID} on {device} ({dtype}) ...")
 processor = WhisperProcessor.from_pretrained(MODEL_ID)
 model = WhisperForConditionalGeneration.from_pretrained(MODEL_ID, torch_dtype=dtype).to(device)
 model.eval()
+# Clear forced English — without this, Whisper tries to transcribe everything
+# in English and outputs empty strings for unknown languages
+model.generation_config.forced_decoder_ids = None
 print("Model loaded.")
 
 
 # ── CELL 6 — Transcribe every test audio (audio embedded in parquet bytes) ──
-# The test set stores audio as bytes inside each parquet row — no separate
-# audio files exist on disk. We read every parquet, decode the 'audio' column
-# bytes with soundfile, and transcribe via HF pipeline which handles clips
-# longer than 30 sec by chunking automatically.
-# Expect ~2-4 hours for ~40 000 clips on GPU T4 x2.
+# Uses model.generate() directly — no pipeline, no config conflicts.
+# Expect ~1-2 hours for ~40 000 clips on GPU T4 x2.
 
-from transformers import pipeline as hf_pipeline
+import numpy as np
 
-pipe = hf_pipeline(
-    "automatic-speech-recognition",
-    model=model,
-    tokenizer=processor.tokenizer,
-    feature_extractor=processor.feature_extractor,
-    device=0 if torch.cuda.is_available() else -1,
-    generate_kwargs={"task": "transcribe"},  # transcribe in source language, not translate to English
-    # return_timestamps=True is intentionally NOT set here — it breaks batching
-    # by forcing single-clip long-form mode. Test clips are ≤30s so no truncation risk.
-)
-
-BATCH_SIZE = 16  # clips processed in parallel on GPU — ~5-10x faster than one-by-one
+BATCH_SIZE = 16
 CHECKPOINT_FILE = "/kaggle/working/submission_checkpoint.csv"
 
 def decode_audio_bytes(audio_field):
-    """Decode parquet audio bytes → 16 kHz numpy array.
-    Primary: soundfile (WAV/FLAC). Fallback: pydub via ffmpeg (webm/mp3/opus/aac).
-    """
-    import numpy as np
+    """Decode parquet audio bytes → 16 kHz float32 numpy array."""
     raw = audio_field["bytes"] if isinstance(audio_field, dict) else bytes(audio_field)
     try:
         arr, sr = sf.read(io.BytesIO(raw), dtype="float32")
@@ -153,20 +125,36 @@ def decode_audio_bytes(audio_field):
         if sr != 16_000:
             import librosa
             arr = librosa.resample(arr, orig_sr=sr, target_sr=16_000)
-        return {"array": arr, "sampling_rate": 16_000}
+        return arr
     except Exception:
         pass
     from pydub import AudioSegment
-    audio = AudioSegment.from_file(io.BytesIO(raw)).set_frame_rate(16_000).set_channels(1)
-    arr = np.array(audio.get_array_of_samples(), dtype=np.float32) / 32768.0
-    return {"array": arr, "sampling_rate": 16_000}
+    seg = AudioSegment.from_file(io.BytesIO(raw)).set_frame_rate(16_000).set_channels(1)
+    return np.array(seg.get_array_of_samples(), dtype=np.float32) / 32768.0
 
-# ── Resume from checkpoint if the session was interrupted ───────────────────
+def transcribe_batch(arrays):
+    """Transcribe a list of 16 kHz float32 arrays using model.generate() directly."""
+    # Truncate to 30 s max — avoids the "> 3000 mel features" error
+    arrays = [arr[:480_000] for arr in arrays]
+    inputs = processor(
+        arrays, sampling_rate=16_000, return_tensors="pt",
+    ).input_features.to(device).to(dtype)
+    with torch.no_grad():
+        ids = model.generate(input_features=inputs, max_new_tokens=225)
+    return processor.batch_decode(ids, skip_special_tokens=True)
+
+# ── Resume from checkpoint (auto-deletes if corrupted from a previous bad run) ─
 if os.path.exists(CHECKPOINT_FILE):
     existing = pd.read_csv(CHECKPOINT_FILE)
-    results  = existing.to_dict("records")
-    done_ids = set(existing["id"])
-    print(f"Resuming from checkpoint: {len(results)} clips already done.")
+    empty_pct = (existing["transcription"].isna() | (existing["transcription"].str.strip() == "")).mean()
+    if empty_pct > 0.5:
+        os.remove(CHECKPOINT_FILE)
+        print(f"Deleted corrupted checkpoint ({empty_pct:.0%} empty transcriptions). Starting fresh.")
+        results, done_ids = [], set()
+    else:
+        results  = existing.to_dict("records")
+        done_ids = set(existing["id"])
+        print(f"Resuming from checkpoint: {len(results)} clips already done.")
 else:
     results, done_ids = [], set()
     print("Starting fresh.")
@@ -178,7 +166,7 @@ print(f"{len(all_parquet_files)} parquet files total. Batch size: {BATCH_SIZE}.\
 
 for pf_idx, pq_file in enumerate(all_parquet_files):
     df = pd.read_parquet(pq_file)
-    df = df[~df["id"].isin(done_ids)]      # skip rows already transcribed
+    df = df[~df["id"].isin(done_ids)]
     if len(df) == 0:
         print(f"[{pf_idx+1}/{len(all_parquet_files)}] already done — skip")
         continue
@@ -189,33 +177,34 @@ for pf_idx, pq_file in enumerate(all_parquet_files):
     rows = list(df.itertuples(index=False))
     for i in range(0, len(rows), BATCH_SIZE):
         chunk = rows[i : i + BATCH_SIZE]
-        batch_audio, batch_ids = [], []
+        arrays, batch_ids, batch_langs = [], [], []
         for row in chunk:
             try:
-                batch_audio.append(decode_audio_bytes(row.audio))
+                arrays.append(decode_audio_bytes(row.audio))
                 batch_ids.append(row.id)
+                batch_langs.append(row.language)
             except Exception as e:
                 print(f"  DECODE ERROR {row.id}: {e}")
-                results.append({"id": row.id, "transcription": ""})
+                results.append({"id": row.id, "language": row.language, "transcription": "."})
                 done_ids.add(row.id)
 
-        if batch_audio:
+        if arrays:
             try:
-                outputs = pipe(batch_audio, batch_size=len(batch_audio))
-                for id_, out in zip(batch_ids, outputs):
-                    results.append({"id": id_, "transcription": out["text"].strip()})
+                texts = transcribe_batch(arrays)
+                for id_, lang_, text in zip(batch_ids, batch_langs, texts):
+                    results.append({"id": id_, "language": lang_, "transcription": text.strip() or "."})
                     done_ids.add(id_)
             except Exception as e:
-                # batch failed — fall back to one-by-one for this chunk
-                print(f"  BATCH ERROR ({e}) — falling back to one-by-one")
-                for id_, audio in zip(batch_ids, batch_audio):
+                print(f"  BATCH ERROR ({e}) — one-by-one")
+                for id_, lang_, arr in zip(batch_ids, batch_langs, arrays):
                     try:
-                        results.append({"id": id_, "transcription": pipe(audio)["text"].strip()})
-                    except Exception:
-                        results.append({"id": id_, "transcription": ""})
+                        text = transcribe_batch([arr])[0].strip() or "."
+                    except Exception as e2:
+                        print(f"    FAILED {id_}: {e2}")
+                        text = "."
+                    results.append({"id": id_, "language": lang_, "transcription": text})
                     done_ids.add(id_)
 
-    # Save after every parquet file — if session dies, resume from here
     pd.DataFrame(results).to_csv(CHECKPOINT_FILE, index=False)
     print(f"  -> checkpoint saved ({len(results)} total)", flush=True)
 
@@ -223,18 +212,39 @@ print(f"\nDone. Total: {len(results)}")
 
 
 # ── CELL 7 — Build submission file ──────────────────────────────────────────
-# Confirmed column names from test parquet inspection:
-#   id           — wav filename, e.g. "QeUUZNkacY_10Jun2025...wav"
-#   transcription — our predicted text
+# Submission format: id, language, transcription  (3 columns, exactly)
 
 # Safety: if the kernel reset after Cell 6 saved the checkpoint, load from disk
 if not results and os.path.exists(CHECKPOINT_FILE):
-    print(f"Loading results from checkpoint file: {CHECKPOINT_FILE}")
+    print(f"Loading results from checkpoint: {CHECKPOINT_FILE}")
     submission_df = pd.read_csv(CHECKPOINT_FILE)
 else:
     submission_df = pd.DataFrame(results)
 
+# Replace any remaining null/empty with "." so Kaggle won't reject the file
+mask = submission_df["transcription"].isna() | (submission_df["transcription"].str.strip() == "")
+if mask.sum() > 0:
+    print(f"Replacing {mask.sum()} null/empty rows with '.'")
+    submission_df.loc[mask, "transcription"] = "."
+
+# Add language column if missing (checkpoint saved before language was tracked)
+if "language" not in submission_df.columns:
+    print("Building id→language map from parquet files...")
+    lang_map = {}
+    for pq_file in sorted(glob.glob(os.path.join(test_path, "**", "*.parquet"), recursive=True)):
+        df_tmp = pd.read_parquet(pq_file, columns=["id", "language"])
+        lang_map.update(dict(zip(df_tmp["id"], df_tmp["language"])))
+    submission_df["language"] = submission_df["id"].map(lang_map)
+    print(f"Language column added. Missing: {submission_df['language'].isna().sum()}")
+
+# Reorder to required format: id, language, transcription
+submission_df = submission_df[["id", "language", "transcription"]]
 submission_df.to_csv("submission.csv", index=False)
-print(submission_df.head())
-print(f"\nWrote submission.csv with {len(submission_df)} rows.")
-print("Go to the competition page -> 'Submit Prediction' and upload submission.csv")
+
+# Verify — all three must look clean before submitting
+sub = pd.read_csv("submission.csv")
+print(f"NaN transcription: {sub['transcription'].isna().sum()}")
+print(f"Empty transcription: {(sub['transcription'].str.strip() == '').sum()}")
+print(f"NaN language: {sub['language'].isna().sum()}")
+print(sub.head())
+print(f"\nWrote submission.csv with {len(sub)} rows.")
