@@ -1,22 +1,6 @@
 """
 Kaggle Notebook 2 — Multilingual data pipeline + Whisper fine-tuning (Track A)
 ================================================================================
-Builds the unified 6-language training set from three separate HF repos,
-fine-tunes Whisper-small with language tokens + temperature sampling, then
-runs inference on the test set to produce a submission.
-
-BEFORE RUNNING:
-  1. Accept the gate on https://huggingface.co/datasets/DigitalUmuganda/Afrivoice_Swahili (instant)
-  2. Accept the gate on https://huggingface.co/datasets/DigitalUmuganda/Afrivoice (instant)
-  3. Check approval status of https://huggingface.co/datasets/MCAA1-MSU/anv_data_ke (manual — may still be pending)
-  4. Kaggle notebook settings: GPU T4x2 or P100, Internet ON
-  5. Add-ons -> Secrets -> HF_TOKEN
-
-IMPORTANT: Cells marked [INSPECT] must be run and read BEFORE the cell that
-follows them — we don't know the exact manifest.jsonl schema for the
-Swahili/Somali (Afrivoice) repos until we can see real content. If the
-field-name guesses below are wrong, the inspect cell will show you the real
-keys; paste them back so the loader can be corrected.
 """
 
 # ── CELL 1 — Install ────────────────────────────────────────────────────────
