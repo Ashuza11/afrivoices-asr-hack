@@ -447,8 +447,21 @@ print(f"Model + processor saved to {CHECKPOINT_DIR}")
 
 
 # ── CELL 12 — Reload fine-tuned model ────────────────────────────────────────
-import torch
+import torch, gc
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
+
+# Free trainer + training model before loading inference copy
+try:
+    del trainer
+except NameError:
+    pass
+try:
+    del model
+except NameError:
+    pass
+gc.collect()
+torch.cuda.empty_cache()
+print(f"GPU memory freed: {torch.cuda.memory_reserved()/1e9:.1f} GB reserved")
 
 ft_processor = WhisperProcessor.from_pretrained(CHECKPOINT_DIR)
 ft_model = WhisperForConditionalGeneration.from_pretrained(
@@ -469,10 +482,37 @@ import kagglehub, glob, os, io, numpy as np, pandas as pd, soundfile as sf
 test_path = kagglehub.dataset_download("digitalumuganda/anv-test-data-nt")
 print("Test data at:", test_path)
 
-BATCH_SIZE      = 16
+BATCH_SIZE      = 8   # reduced from 16 to avoid OOM after training
 CHECKPOINT_FILE = "/kaggle/working/submission_ft_checkpoint.csv"
 
-# Reuse the same decode_audio helper from Cell 4
+# decode_audio defined here so this cell runs safely after a kernel restart
+def decode_audio(audio_field):
+    """Accept HF Audio dict, bytes dict, or raw bytes → 16 kHz float32 array."""
+    if isinstance(audio_field, dict) and "array" in audio_field:
+        arr = np.array(audio_field["array"], dtype=np.float32)
+        sr = audio_field.get("sampling_rate", 16000)
+        if sr != 16000:
+            import librosa
+            arr = librosa.resample(arr, orig_sr=sr, target_sr=16000)
+        return arr
+    raw = audio_field.get("bytes") if isinstance(audio_field, dict) else audio_field
+    if isinstance(raw, bytes) and len(raw) > 0:
+        try:
+            arr, sr = sf.read(io.BytesIO(raw), dtype="float32")
+            if arr.ndim > 1:
+                arr = arr.mean(axis=1)
+            if sr != 16000:
+                import librosa
+                arr = librosa.resample(arr, orig_sr=sr, target_sr=16000)
+            return arr
+        except Exception:
+            pass
+        from pydub import AudioSegment
+        seg = (AudioSegment.from_file(io.BytesIO(raw))
+               .set_frame_rate(16000).set_channels(1))
+        return np.array(seg.get_array_of_samples(), dtype=np.float32) / 32768.0
+    raise ValueError(f"Cannot decode audio — got type {type(audio_field)}, "
+                     f"dict keys: {list(audio_field.keys()) if isinstance(audio_field, dict) else 'N/A'}")
 
 def transcribe_batch_ft(arrays, language=None):
     """Transcribe with the fine-tuned model.
