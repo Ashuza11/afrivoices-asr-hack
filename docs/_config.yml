@@ -1,0 +1,11 @@
+title: "AfriVoices ASR — Edge Multilingual Speech Recognition for East Africa"
+description: "A single unified ASR model for Swahili, Kikuyu, Luo, Somali, Maasai and Kalenjin, built for the AfriVoices East Africa ASR Hackathon 2026."
+theme: minima
+permalink: pretty
+
+author:
+  name: Albino Mwigiri
+  email: ashuza1411@gmail.com
+
+plugins:
+  - jekyll-seo-tag
