@@ -60,34 +60,31 @@ All datasets are licensed under CC BY 4.0 and are publicly available on Hugging 
 
 ### Training Data Composition
 
-**Round 1 (baseline fine-tune, Colab T4, 600 steps):**
-- 5,000 Swahili clips
-- 2,000 Somali clips
-- 1,000 clips × 4 ANV languages = 4,000 clips
-- **Total: ~11,000 clips**
+**Round 1 (Colab T4, 600 steps):**
+- 5,000 Swahili + 2,000 Somali + 1,000 × 4 ANV = **~11,000 clips**
+- Inference crashed (Colab disk full at 37.5 GB test set download)
+- Eval WER on held-out set: **1.933** at step 400 (best checkpoint)
 
-**Round 2 (Modal A100, 1,500 steps from base model):**
-- Same data composition
-- Result: WER **0.89330** (↓ from baseline 1.61077, −44.6%)
+**Round 2 (Modal A100, 1,500 steps from base whisper-small):**
+- Same data composition as Round 1
+- Result: WER **0.89330** on public leaderboard (−44.6% vs baseline)
 
 **Round 3 (Modal A100, 2,000 steps from Round 2 checkpoint) — in progress:**
-- 8,000 Swahili clips
-- 4,000 Somali clips
-- 2,000 clips × 4 ANV languages = 8,000 clips
-- **Total: ~20,000 clips**
+- 8,000 Swahili + 4,000 Somali + 2,000 × 4 ANV = **~20,000 clips**
 - Learning rate lowered to 5e-6 (fine-tuning a fine-tuned model)
 - *Results pending*
 
 ### Training Infrastructure
 
-| Component | Round 1 | Round 2 & 3 |
+| Component | Round 1 (Colab) | Round 2 & 3 (Modal) |
 |---|---|---|
-| Hardware | Google Colab T4 (free) | Modal.com A100 40GB |
+| Hardware | Google Colab T4 (free tier) | Modal.com A100 40GB (~$5–15/run) |
 | Batch size (per device) | 4 | 16 |
 | Effective batch size | 16 | 32 |
 | Optimizer | Adafactor | Adafactor |
 | Mixed precision | fp16 | fp16 |
-| Duration | ~35 min (600 steps) | ~35 min (1,500 steps) |
+| Duration | ~86 min (600 steps) | ~35 min (1,500 steps) |
+| Inference | Crashed (disk full) | ✅ 45 min on A100 |
 
 **Why Adafactor instead of AdamW?**
 AdamW stores momentum and variance tensors for every parameter — for Whisper-small's 244M parameters, that's ~1.84 GB of optimizer state. On Colab's 12.7 GB RAM (shared with the OS, the 11k training clips at 5.3 GB, and the model at ~1 GB), AdamW pushed us over the limit at step 2. Adafactor reconstructs the second moment from a factored low-rank approximation, cutting optimizer RAM to ~0.24 GB.
@@ -101,11 +98,13 @@ Loading 11,000 audio clips as float32 spectrograms requires ~10.5 GB of RAM. Sto
 
 ### WER Progression
 
-| Stage | Steps | WER (public leaderboard) |
-|---|---|---|
-| Zero-shot whisper-small (baseline) | — | 1.61077 |
-| Round 2 fine-tune (A100, 1,500 steps) | 1,500 | **0.89330** |
-| Round 3 fine-tune (A100, 2,000 steps) | 3,500 total | *pending* |
+| Stage | Hardware | Steps | Eval WER | Leaderboard WER |
+|---|---|---|---|---|
+| Zero-shot whisper-small | — | — | — | 1.61077 |
+| Round 1 fine-tune | Colab T4 | 600 | 1.933 (step 400) | *(inference crashed)* |
+| Round 2 fine-tune | Modal A100 | 1,500 | — | **0.89330** |
+| Round 3 fine-tune | Modal A100 | +2,000 | — | *pending* |
+| Kaggle experiment A | Kaggle P100 | TBD | — | *pending* |
 
 The metric is **average WER across all six languages** (unweighted mean). Lower is better.
 
