@@ -7,7 +7,7 @@
 import subprocess
 subprocess.run([
     "pip", "install", "-q",
-    "evaluate", "jiwer", "kagglehub",
+    "evaluate", "jiwer", "kagglehub", "pydub",
 ], check=True)
 
 # %% [code]
@@ -66,6 +66,10 @@ def decode_audio(field):
             return arr
         except Exception:
             pass
+        from pydub import AudioSegment
+        seg = (AudioSegment.from_file(io.BytesIO(raw))
+               .set_frame_rate(16000).set_channels(1))
+        return np.array(seg.get_array_of_samples(), dtype=np.float32) / 32768.0
     raise ValueError("unreadable audio")
 
 
