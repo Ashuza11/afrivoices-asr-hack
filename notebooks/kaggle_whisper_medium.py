@@ -6,9 +6,7 @@
 import subprocess
 subprocess.run([
     "pip", "install", "-q",
-    "transformers==4.46.3", "accelerate>=0.26.0",
-    "datasets==2.20.0", "evaluate", "jiwer",
-    "soundfile", "librosa", "huggingface_hub>=0.21",
+    "evaluate", "jiwer", "kagglehub",
 ], check=True)
 
 # %% [code]
