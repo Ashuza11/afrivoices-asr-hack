@@ -487,7 +487,7 @@ def train():
     secrets=secrets,
     memory=65536,
 )
-def run_inference():
+def run_inference(fresh: bool = False):
     import time
     import numpy as np
     import pandas as pd
@@ -584,9 +584,10 @@ def run_inference():
                   if os.path.exists(CHECKPOINT_FILE) else 0
     model_is_fresh = model_mtime > ckpt_mtime
 
-    if model_is_fresh and os.path.exists(CHECKPOINT_FILE):
+    if (model_is_fresh or fresh) and os.path.exists(CHECKPOINT_FILE):
         os.remove(CHECKPOINT_FILE)
-        print("New model detected — starting fresh inference.")
+        reason = "explicit --fresh flag" if fresh else "new model detected"
+        print(f"Starting fresh inference ({reason}).")
 
     if os.path.exists(CHECKPOINT_FILE):
         existing  = pd.read_csv(CHECKPOINT_FILE)
@@ -678,11 +679,11 @@ def run_inference():
 
 # ── Local entrypoint ─────────────────────────────────────────────────────────
 @app.local_entrypoint()
-def main(skip_train: bool = False):
+def main(skip_train: bool = False, fresh: bool = False):
     if not skip_train:
         print("=== Step 1/2: Training ===")
         train.remote()
     print("\n=== Inference ===")
-    run_inference.remote()
+    run_inference.remote(fresh=fresh)
     print("\nAll done! Download your submission:")
     print("  modal volume get afrivoices-vol submission.csv .")
