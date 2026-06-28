@@ -432,7 +432,7 @@ def train():
         eval_strategy               = "steps",
         per_device_eval_batch_size  = 8,
         predict_with_generate       = True,
-        generation_max_length       = 128,
+        generation_max_length       = 225,
         save_steps                  = 300,
         eval_steps                  = 300,
         save_total_limit            = 3,
@@ -521,20 +521,11 @@ def run_inference(fresh: bool = False):
     LANG_TO_WHISPER = {"swa": "sw", "som": "so",
                        "kik": None, "luo": None, "mas": None, "kln": None}
 
-    import re as _re
-    def _normalize(text: str) -> str:
-        # Lowercase, strip punctuation, preserve unicode letters/digits/apostrophes.
-        # Matches WAXAL-NET and standard African ASR evaluation practice.
-        text = text.lower().strip()
-        text = _re.sub(r"[^\w\s']", " ", text, flags=_re.UNICODE)
-        text = text.replace("_", " ")
-        return " ".join(text.split())
-
     def transcribe_batch(arrays, language=None):
         arrays = [a[:480_000] for a in arrays]
         inputs = ft_processor(arrays, sampling_rate=16000, return_tensors="pt")\
                    .input_features.to(device).to(torch.float16)
-        gen_kw = {"max_new_tokens": 128}
+        gen_kw = {"max_new_tokens": 64}
         if language:
             lid = ft_processor.tokenizer.convert_tokens_to_ids(f"<|{language}|>")
             tid = ft_processor.tokenizer.convert_tokens_to_ids("<|transcribe|>")
@@ -542,8 +533,7 @@ def run_inference(fresh: bool = False):
             gen_kw["forced_decoder_ids"] = [[1, lid], [2, tid], [3, nid]]
         with torch.no_grad():
             ids = ft_model.generate(input_features=inputs, **gen_kw)
-        texts = ft_processor.batch_decode(ids, skip_special_tokens=True)
-        return [_normalize(t) for t in texts]
+        return ft_processor.batch_decode(ids, skip_special_tokens=True)
 
     def safe_decode(row):
         try:

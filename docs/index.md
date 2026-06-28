@@ -104,6 +104,7 @@ Loading 11,000 audio clips as float32 spectrograms requires ~10.5 GB of RAM. Sto
 | Round 1 fine-tune | Colab T4 | 600 | — | *(inference crashed)* | — |
 | Round 2 fine-tune | Modal A100 | 1,500 | — | **0.89330** | −44.6% |
 | Round 3 fine-tune | Modal A100 | +2,000 from R2 ckpt | 0.5442 | 0.91618 | **+2.6% (regression)** |
+| Inference fix attempt | Modal A100 | — (R2 weights) | — | 0.93813 | **+5.0% (normalisation backfired)** |
 | Kaggle experiment A | Kaggle T4 | TBD | — | *pending* | — |
 
 The metric is **average WER across all six languages** (unweighted mean). Lower is better. Round 3 regressed despite more data and more steps — see the post-mortem analysis below.
@@ -209,6 +210,10 @@ The biggest quick wins are not in more training data or more steps — they are 
 **Kaggle REST API 404:** Our initial approach used the Kaggle v1 datasets REST API to list and download test parquet files one at a time. The API returned 404 — the correct approach is `kagglehub.dataset_download()` which handles auth and routing automatically.
 
 **Training from scratch on round 3:** The first draft of `modal_finetune.py` loaded `openai/whisper-small` every run, discarding the fine-tuned checkpoint. Fixed to load from the volume checkpoint or HF Hub fallback.
+
+**Text normalisation backfired (WER 0.89330 → 0.93813):** Based on research showing WAXAL-NET applies lowercase + punctuation removal before computing WER, we applied the same normalisation to our inference output. This made WER significantly worse. The conclusion: the competition evaluates WER against references stored in their original format (mixed-case, with punctuation — matching Whisper's output style). Applying lowercase on our side turned every sentence-initial capital into a substitution error and every missing period into a deletion. At 12,553 Swahili clips alone (30% of the leaderboard), that is thousands of extra errors. The lesson: normalisation must be applied to both sides identically or not at all. Since we cannot inspect the competition's reference format, we reverted to raw Whisper output, which was already in the same format as the references.
+
+**max_new_tokens 64 → 128 also hurt:** Whisper hallucinates or loops when given more token budget than the utterance needs, especially on low-resource languages (kik, luo, mas, kln) where EOS prediction is unreliable. 64 tokens naturally bounded hallucinations; 128 doubled the room for spurious insertions. Reverted to 64.
 
 **Inference checkpoint reuse:** After Round 3 training, the inference script found 41,733 rows in the old checkpoint file and skipped all 94 parquet files, producing an identical submission to Round 2. Fixed by comparing model file modification time to checkpoint modification time — if the model is newer, the checkpoint is discarded and inference runs fresh.
 
