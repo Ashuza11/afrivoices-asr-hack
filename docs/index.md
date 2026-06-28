@@ -98,28 +98,28 @@ Loading 11,000 audio clips as float32 spectrograms requires ~10.5 GB of RAM. Sto
 
 ### WER Progression
 
-| Stage | Hardware | Steps | Eval WER | Leaderboard WER |
-|---|---|---|---|---|
-| Zero-shot whisper-small | — | — | — | 1.61077 |
-| Round 1 fine-tune | Colab T4 | 600 | 1.933 (step 400) | *(inference crashed)* |
-| Round 2 fine-tune | Modal A100 | 1,500 | — | **0.89330** |
-| Round 3 fine-tune | Modal A100 | +2,000 | — | *pending* |
-| Kaggle experiment A | Kaggle P100 | TBD | — | *pending* |
+| Stage | Hardware | Steps | Train Loss | Leaderboard WER | Δ vs previous |
+|---|---|---|---|---|---|
+| Zero-shot whisper-small | — | — | — | 1.61077 | baseline |
+| Round 1 fine-tune | Colab T4 | 600 | — | *(inference crashed)* | — |
+| Round 2 fine-tune | Modal A100 | 1,500 | — | **0.89330** | −44.6% |
+| Round 3 fine-tune | Modal A100 | +2,000 from R2 ckpt | 0.5442 | 0.91618 | **+2.6% (regression)** |
+| Kaggle experiment A | Kaggle T4 | TBD | — | *pending* | — |
 
-The metric is **average WER across all six languages** (unweighted mean). Lower is better.
+The metric is **average WER across all six languages** (unweighted mean). Lower is better. Round 3 regressed despite more data and more steps — see the post-mortem analysis below.
 
-### Per-Language Test Set Breakdown
+### Per-Language Test Set Distribution
 
-| Language | Test clips | WER (Round 2) |
+| Language | Test clips | Share of test set |
 |---|---|---|
-| swa | 12,553 | *to be measured* |
-| kik | 9,192 | *to be measured* |
-| luo | 7,437 | *to be measured* |
-| kln | 4,837 | *to be measured* |
-| som | 3,925 | *to be measured* |
-| mas | 3,789 | *to be measured* |
+| swa | 12,553 | 30.1% |
+| kik | 9,192 | 22.0% |
+| luo | 7,437 | 17.8% |
+| kln | 4,837 | 11.6% |
+| som | 3,925 | 9.4% |
+| mas | 3,789 | 9.1% |
 
-*Per-language WER will be added once we run the per-language evaluation script.*
+Swahili alone accounts for 30% of the leaderboard score, making it the single most important language for overall WER.
 
 ---
 
@@ -164,6 +164,44 @@ See the full [hardware validation report](hardware_validation.md).
 
 ## What Didn't Work (and What We Learned)
 
+### Round 3 Regression Post-Mortem
+
+Round 3 made things worse (0.89330 → 0.91618). This is the most instructive failure of the project. After a thorough code audit, we identified five compounding causes:
+
+**1. Data distribution shift hurt the dominant language.**
+
+| Language | Round 2 clips | Round 2 % | Round 3 clips | Round 3 % |
+|---|---|---|---|---|
+| Swahili | 5,951 | **49.8%** | 5,951 | **33.2%** |
+| Somali | 2,000 | 16.7% | 4,000 | 22.3% |
+| ANV × 4 | 4,000 | 33.5% | 8,000 | 44.5% |
+
+Swahili — which accounts for 30% of the test leaderboard — saw its training proportion drop from half to a third. The model received more gradient signal toward the four ANV languages, which have no Whisper pretraining to anchor them. Continued fine-tuning on this skewed distribution eroded the strong Swahili representations Whisper already had from its 680k-hour pretraining. Swahili is disproportionately easy to learn from the pre-trained model and disproportionately damaging to lose.
+
+**2. Over-training a model that had already converged.**
+
+Round 2 found a good solution in 1,500 steps from a cold start. Round 3 applied 2,000 more steps to that solution at a lower LR (5e-6) on a different data composition. The final training loss was 0.5442 — very low, suggesting the model memorised the training distribution rather than generalising. More steps + different data pushed the model away from the Round 2 solution without finding a better one.
+
+**3. No text normalisation in training labels or inference output.**
+
+Training transcriptions use different conventions across the three data sources: `normalized_transcription` (Swahili/Somali) vs raw `transcription`/`actualSentence` columns (ANV). The model learns to reproduce the output style of each source inconsistently. During inference, the model output is decoded and stripped of special tokens but otherwise not normalised — mixed case, punctuation, and spacing variations are all passed to the submission CSV as-is. If the competition's reference transcriptions use a different normalisation, every such mismatch is counted as a substitution or insertion in WER.
+
+**4. Eval metric during training uses a different setting than inference.**
+
+`Seq2SeqTrainingArguments` sets `generation_max_length=225` for the eval loop in `compute_metrics`. But during inference, the code uses `max_new_tokens=64`. The `load_best_model_at_end=True` flag selects the checkpoint with the best WER at 225 tokens, then deploys it at 64 tokens. These are not equivalent for a model that has learned to produce longer sequences. A checkpoint that looks best at 225 tokens may be sub-optimal when hard-capped at 64.
+
+**5. No language token for four of six test languages.**
+
+For kik, luo, mas, and kln, `LANG_TO_WHISPER` maps to `None`, so inference runs without a forced language prefix. Without this constraint, the Whisper decoder can freely choose its output language based on acoustic similarity. Since Swahili was the dominant training language in both rounds, the model may silently switch to Swahili-like output for ambiguous ANV utterances, inflating WER on those four languages.
+
+**What this tells us about the remaining road:**
+
+The biggest quick wins are not in more training data or more steps — they are in post-processing and decoding strategy. Specifically: (a) adding text normalisation to the inference output, (b) aligning `max_new_tokens` between eval and inference, and (c) investigating whether adding Whisper language-id tokens for ANV languages (via vocab extension) helps or hurts. The best current submission is still Round 2 (WER 0.89330).
+
+---
+
+### Earlier Issues
+
 **Colab RAM crashes:** Three separate OOM crashes before training completed. Root causes: (1) float32 in-memory records during data loading used 10.5 GB; (2) AdamW optimizer states added 1.84 GB at step 2. Both fixed before the successful run.
 
 **Slow inference with max_new_tokens=225:** The original Whisper default of 225 output tokens caused the model to run to the limit on every clip from languages it had never seen (Kikuyu, Luo, Maasai, Kalenjin). Spoken utterances almost never exceed 30 words (~50 tokens). Reducing to `max_new_tokens=64` cut inference time by ~3×.
@@ -171,6 +209,10 @@ See the full [hardware validation report](hardware_validation.md).
 **Kaggle REST API 404:** Our initial approach used the Kaggle v1 datasets REST API to list and download test parquet files one at a time. The API returned 404 — the correct approach is `kagglehub.dataset_download()` which handles auth and routing automatically.
 
 **Training from scratch on round 3:** The first draft of `modal_finetune.py` loaded `openai/whisper-small` every run, discarding the fine-tuned checkpoint. Fixed to load from the volume checkpoint or HF Hub fallback.
+
+**Inference checkpoint reuse:** After Round 3 training, the inference script found 41,733 rows in the old checkpoint file and skipped all 94 parquet files, producing an identical submission to Round 2. Fixed by comparing model file modification time to checkpoint modification time — if the model is newer, the checkpoint is discarded and inference runs fresh.
+
+**37.5 GB re-download on every run:** `kagglehub` cached the test archive to `/root/.cache/`, which is ephemeral per container. Fixed by copying the extracted parquet files (a few GB) to the Modal persistent volume after the first download — subsequent runs load from the volume directly.
 
 ---
 
