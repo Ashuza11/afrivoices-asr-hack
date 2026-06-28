@@ -557,6 +557,16 @@ def run_inference():
     BATCH_SIZE      = 32
     SAVE_EVERY      = 5
 
+    model_mtime = os.path.getmtime(f"{CHECKPOINT_DIR}/config.json") \
+                  if os.path.exists(f"{CHECKPOINT_DIR}/config.json") else 0
+    ckpt_mtime  = os.path.getmtime(CHECKPOINT_FILE) \
+                  if os.path.exists(CHECKPOINT_FILE) else 0
+    model_is_fresh = model_mtime > ckpt_mtime
+
+    if model_is_fresh and os.path.exists(CHECKPOINT_FILE):
+        os.remove(CHECKPOINT_FILE)
+        print("New model detected — starting fresh inference.")
+
     if os.path.exists(CHECKPOINT_FILE):
         existing  = pd.read_csv(CHECKPOINT_FILE)
         empty_pct = (existing["transcription"].isna() |
