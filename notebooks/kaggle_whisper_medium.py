@@ -333,7 +333,7 @@ training_args = Seq2SeqTrainingArguments(
     gradient_accumulation_steps = 8,
     learning_rate               = 1e-5,
     warmup_steps                = 200,
-    max_steps                   = 1000,
+    max_steps                   = 500,
     gradient_checkpointing      = True,
     fp16                        = True,
     optim                       = "adafactor",
@@ -353,6 +353,19 @@ training_args = Seq2SeqTrainingArguments(
     dataloader_num_workers      = 0,
 )
 
+from transformers import TrainerCallback
+
+class HubCheckpointCallback(TrainerCallback):
+    """Push model to HF Hub on every checkpoint save so progress survives session expiry."""
+    def on_save(self, args, state, control, **kwargs):
+        try:
+            kwargs["model"].push_to_hub(
+                repo_id, token=HF_TOKEN,
+                commit_message=f"checkpoint step {state.global_step}",
+            )
+        except Exception as e:
+            print(f"  Hub push failed at step {state.global_step}: {e}")
+
 trainer = Seq2SeqTrainer(
     model            = model,
     args             = training_args,
@@ -361,9 +374,20 @@ trainer = Seq2SeqTrainer(
     data_collator    = data_collator,
     compute_metrics  = compute_metrics,
     processing_class = feature_extractor,
+    callbacks        = [HubCheckpointCallback()],
 )
 
-trainer.train()
+# Resume from HF Hub checkpoint if a previous session was interrupted
+import huggingface_hub, tempfile, os as _os
+try:
+    _snapshot = huggingface_hub.snapshot_download(repo_id, token=HF_TOKEN)
+    if _os.path.exists(f"{_snapshot}/config.json"):
+        print(f"Resuming from HF Hub checkpoint: {repo_id}")
+        trainer.train(resume_from_checkpoint=_snapshot)
+    else:
+        trainer.train()
+except Exception:
+    trainer.train()
 trainer.save_model(CKPT_DIR)
 processor.save_pretrained(CKPT_DIR)
 
