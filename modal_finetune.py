@@ -541,17 +541,28 @@ def run_inference():
         except Exception:
             return row.id, row.language, None
 
-    # Download test data via kagglehub (new key-only auth, no username needed).
-    # Files are cached on the volume so re-runs are instant.
-    import glob
-    DATASET    = "digitalumuganda/anv-test-data-nt"
-    CACHE_DIR  = f"{VOL_PATH}/kaggle_cache"
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    print("Downloading Kaggle test data (cached on volume after first run)...")
-    test_path = _kaggle_download_dataset(DATASET, KAGGLE_API_TOKEN, CACHE_DIR)
-    vol.commit()  # persist the downloaded files in case we need to re-run
-    all_parquet_files = sorted(glob.glob(os.path.join(test_path, "**", "*.parquet"), recursive=True))
-    print(f"{len(all_parquet_files)} parquet files found at {test_path}")
+    import glob, shutil
+    TEST_DATA_DIR = f"{VOL_PATH}/test_parquets"
+    all_parquet_files = sorted(glob.glob(os.path.join(TEST_DATA_DIR, "**", "*.parquet"), recursive=True))
+
+    if all_parquet_files:
+        print(f"Test data on volume: {len(all_parquet_files)} parquet files — skipping download.")
+    else:
+        print("Downloading Kaggle test data (first time only — parquets cached to volume)...")
+        os.environ["KAGGLE_KEY"] = KAGGLE_API_TOKEN
+        import kagglehub
+        test_path = kagglehub.dataset_download("digitalumuganda/anv-test-data-nt")
+        downloaded = sorted(glob.glob(os.path.join(test_path, "**", "*.parquet"), recursive=True))
+        print(f"Copying {len(downloaded)} parquet files to volume...")
+        os.makedirs(TEST_DATA_DIR, exist_ok=True)
+        for pf in downloaded:
+            rel = os.path.relpath(pf, test_path)
+            dst = os.path.join(TEST_DATA_DIR, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(pf, dst)
+        vol.commit()
+        all_parquet_files = sorted(glob.glob(os.path.join(TEST_DATA_DIR, "**", "*.parquet"), recursive=True))
+        print(f"{len(all_parquet_files)} parquet files saved to volume.")
 
     CHECKPOINT_FILE = f"{VOL_PATH}/submission_checkpoint.csv"
     BATCH_SIZE      = 32
