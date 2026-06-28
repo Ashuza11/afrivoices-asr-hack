@@ -432,7 +432,7 @@ def train():
         eval_strategy               = "steps",
         per_device_eval_batch_size  = 8,
         predict_with_generate       = True,
-        generation_max_length       = 225,
+        generation_max_length       = 128,
         save_steps                  = 300,
         eval_steps                  = 300,
         save_total_limit            = 3,
@@ -521,11 +521,20 @@ def run_inference():
     LANG_TO_WHISPER = {"swa": "sw", "som": "so",
                        "kik": None, "luo": None, "mas": None, "kln": None}
 
+    import re as _re
+    def _normalize(text: str) -> str:
+        # Lowercase, strip punctuation, preserve unicode letters/digits/apostrophes.
+        # Matches WAXAL-NET and standard African ASR evaluation practice.
+        text = text.lower().strip()
+        text = _re.sub(r"[^\w\s']", " ", text, flags=_re.UNICODE)
+        text = text.replace("_", " ")
+        return " ".join(text.split())
+
     def transcribe_batch(arrays, language=None):
         arrays = [a[:480_000] for a in arrays]
         inputs = ft_processor(arrays, sampling_rate=16000, return_tensors="pt")\
                    .input_features.to(device).to(torch.float16)
-        gen_kw = {"max_new_tokens": 64}
+        gen_kw = {"max_new_tokens": 128}
         if language:
             lid = ft_processor.tokenizer.convert_tokens_to_ids(f"<|{language}|>")
             tid = ft_processor.tokenizer.convert_tokens_to_ids("<|transcribe|>")
@@ -533,7 +542,8 @@ def run_inference():
             gen_kw["forced_decoder_ids"] = [[1, lid], [2, tid], [3, nid]]
         with torch.no_grad():
             ids = ft_model.generate(input_features=inputs, **gen_kw)
-        return ft_processor.batch_decode(ids, skip_special_tokens=True)
+        texts = ft_processor.batch_decode(ids, skip_special_tokens=True)
+        return [_normalize(t) for t in texts]
 
     def safe_decode(row):
         try:
@@ -634,13 +644,13 @@ def run_inference():
                     texts = transcribe_batch(arrays, language=wh_lang)
                     for id_, lang_, text in zip(batch_ids, batch_langs, texts):
                         results.append({"id": id_, "language": lang_,
-                                        "transcription": text.strip() or "."})
+                                        "transcription": text or "."})
                         done_ids.add(id_)
                 except Exception as e:
                     print(f"  BATCH ERROR: {e} — one-by-one fallback")
                     for id_, lang_, arr in zip(batch_ids, batch_langs, arrays):
                         try:
-                            text = transcribe_batch([arr], language=wh_lang)[0].strip() or "."
+                            text = transcribe_batch([arr], language=wh_lang)[0] or "."
                         except Exception:
                             text = "."
                         results.append({"id": id_, "language": lang_, "transcription": text})
