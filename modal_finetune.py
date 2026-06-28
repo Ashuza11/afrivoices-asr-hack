@@ -113,6 +113,7 @@ def train():
     import io, json, tarfile, lzma
     import numpy as np
     import pandas as pd
+    import glob
     import torch
     from dataclasses import dataclass
     from typing import Any, Dict, List
@@ -140,60 +141,75 @@ def train():
     feature_extractor = processor.feature_extractor
     tokenizer         = processor.tokenizer
 
-    # ── Swahili (cache-first, target-aware) ──────────────────────────────────
+    # ── Swahili (cache-first, multi-shard) ───────────────────────────────────
     SWA_TARGET = 8000
     SWA_CACHE  = f"{RECORDS_DIR}/swa_records.pkl"
-    _cached = _load_records(SWA_CACHE) if os.path.exists(SWA_CACHE) else []
-    if len(_cached) >= SWA_TARGET:
-        swa_records = _cached
+    if os.path.exists(SWA_CACHE):
+        swa_records = _load_records(SWA_CACHE)
         print(f"Swahili: {len(swa_records)} clips from cache.")
     else:
-        if _cached:
-            print(f"Cache has {len(_cached)} clips, need {SWA_TARGET}. Re-downloading...")
-            os.remove(SWA_CACHE)
-        N_SAMPLES = SWA_TARGET
-        print(f"Downloading {N_SAMPLES} Swahili clips from HF Hub...")
-        manifest_path = hf_hub_download(
-            repo_id="DigitalUmuganda/Afrivoice_Swahili",
-            filename="agriculture_swahili_train/manifest_0.jsonl",
-            repo_type="dataset", token=HF_TOKEN,
-        )
-        with open(manifest_path) as f:
-            all_entries = [json.loads(l) for l in f]
-        wanted = {}
-        for entry in all_entries:
-            text = (entry.get("normalized_transcription") or "").strip()
-            if text:
-                wanted[entry["key"]] = text
-            if len(wanted) >= N_SAMPLES:
-                break
-
-        audio_tar = hf_hub_download(
-            repo_id="DigitalUmuganda/Afrivoice_Swahili",
-            filename="agriculture_swahili_train/audio/audio_0.tar.xz",
-            repo_type="dataset", token=HF_TOKEN,
-        )
         swa_records = []
         tokenizer.set_prefix_tokens(language="swahili", task="transcribe")
-        with tarfile.open(audio_tar, "r:xz") as tar:
-            for member in tar:
-                if not member.name.endswith(".webm"):
-                    continue
-                key = os.path.basename(member.name).replace(".webm", "")
-                if key not in wanted:
-                    continue
-                try:
-                    arr = _decode_audio({"bytes": tar.extractfile(member).read()})
-                    arr = arr[:480_000]
-                except Exception:
-                    continue
-                feats  = feature_extractor(arr, sampling_rate=16000).input_features[0].astype(np.float16)
-                labels = tokenizer(wanted[key]).input_ids
-                swa_records.append({"input_features": feats, "labels": labels})
-                if len(swa_records) % 500 == 0:
-                    print(f"  {len(swa_records)}/{N_SAMPLES}", flush=True)
-                if len(swa_records) >= N_SAMPLES:
-                    break
+        for shard in range(10):
+            if len(swa_records) >= SWA_TARGET:
+                break
+            try:
+                manifest_path = hf_hub_download(
+                    repo_id="DigitalUmuganda/Afrivoice_Swahili",
+                    filename=f"agriculture_swahili_train/manifest_{shard}.jsonl",
+                    repo_type="dataset", token=HF_TOKEN,
+                )
+            except Exception:
+                break
+            with open(manifest_path) as f:
+                all_entries = [json.loads(l) for l in f]
+            if shard == 0 and all_entries:
+                print(f"  manifest sample: {list(all_entries[0].keys())} | first key={all_entries[0].get('key','?')!r}", flush=True)
+            wanted = {}
+            for entry in all_entries:
+                text = (
+                    entry.get("normalized_transcription") or
+                    entry.get("transcription") or
+                    entry.get("transcript") or
+                    entry.get("text") or ""
+                ).strip()
+                if text:
+                    k = entry.get("key", "")
+                    wanted[k] = text
+                    wanted[os.path.basename(k)] = text
+            try:
+                audio_tar = hf_hub_download(
+                    repo_id="DigitalUmuganda/Afrivoice_Swahili",
+                    filename=f"agriculture_swahili_train/audio/audio_{shard}.tar.xz",
+                    repo_type="dataset", token=HF_TOKEN,
+                )
+            except Exception:
+                break
+            print(f"  shard {shard}: {len(wanted)} manifest entries", flush=True)
+            with tarfile.open(audio_tar, "r:xz") as tar:
+                members = list(tar.getmembers())
+                if shard == 0 and members:
+                    sample = [m.name for m in members[:3]]
+                    print(f"  tar sample members: {sample}", flush=True)
+                for member in members:
+                    ext = os.path.splitext(member.name)[1].lower()
+                    if ext not in (".webm", ".wav", ".mp3", ".flac", ".ogg", ".opus"):
+                        continue
+                    base = os.path.splitext(os.path.basename(member.name))[0]
+                    if base not in wanted:
+                        continue
+                    try:
+                        arr = _decode_audio({"bytes": tar.extractfile(member).read()})
+                        arr = arr[:480_000]
+                    except Exception:
+                        continue
+                    feats  = feature_extractor(arr, sampling_rate=16000).input_features[0].astype(np.float16)
+                    labels = tokenizer(wanted[base]).input_ids
+                    swa_records.append({"input_features": feats, "labels": labels})
+                    if len(swa_records) % 500 == 0:
+                        print(f"  {len(swa_records)}/{SWA_TARGET}", flush=True)
+                    if len(swa_records) >= SWA_TARGET:
+                        break
         print(f"Swahili: {len(swa_records)} clips ready.")
         _save_records(swa_records, SWA_CACHE)
         vol.commit()
@@ -439,8 +455,12 @@ def train():
         processing_class = feature_extractor,
     )
 
+    checkpoint_dirs = sorted(glob.glob(f"{CHECKPOINT_DIR}/checkpoint-*"))
+    resume_from     = checkpoint_dirs[-1] if checkpoint_dirs else None
+    if resume_from:
+        print(f"Resuming from {resume_from}")
     print("\nStarting training...")
-    trainer.train()
+    trainer.train(resume_from_checkpoint=resume_from)
     print("Training done.")
 
     trainer.save_model(CHECKPOINT_DIR)
