@@ -265,7 +265,6 @@ modal volume get afrivoices-vol submission.csv .
 
 ## Citation
 
-{% raw %}
 ```bibtex
 @misc{mwigiri2026afrivoices,
   title   = {AfriVoices ASR: Fine-tuning Whisper-small for Six East African Languages},
@@ -277,7 +276,7 @@ modal volume get afrivoices-vol submission.csv .
 
 @misc{digitalumuganda2026afrivoices,
   title   = {AfriVoices East Africa: ASR Hackathon},
-  author  = {{Digital Umuganda} and {Maseno University} and {Maseno Center for Applied Artificial Intelligence}},
+  author  = {Digital Umuganda and Maseno University and Maseno Center for Applied Artificial Intelligence},
   year    = {2026},
   url     = {https://kaggle.com/competitions/afrivoices-east-africa-asr-hackathon}
 }
@@ -289,7 +288,6 @@ modal volume get afrivoices-vol submission.csv .
   url     = {https://arxiv.org/abs/2212.04356}
 }
 ```
-{% endraw %}
 
 ---
 
