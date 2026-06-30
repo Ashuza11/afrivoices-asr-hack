@@ -265,6 +265,7 @@ modal volume get afrivoices-vol submission.csv .
 
 ## Citation
 
+{% raw %}
 ```bibtex
 @misc{mwigiri2026afrivoices,
   title   = {AfriVoices ASR: Fine-tuning Whisper-small for Six East African Languages},
@@ -288,6 +289,7 @@ modal volume get afrivoices-vol submission.csv .
   url     = {https://arxiv.org/abs/2212.04356}
 }
 ```
+{% endraw %}
 
 ---
 
