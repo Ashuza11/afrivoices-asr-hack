@@ -109,8 +109,8 @@ def _kaggle_download_dataset(dataset: str, kaggle_key: str, cache_dir: str) -> s
     secrets=secrets,
     memory=65536,
 )
-def train():
-    import io, json, tarfile, lzma
+def train(resume: bool = False):
+    import io, json, tarfile, lzma, shutil
     import numpy as np
     import pandas as pd
     import glob
@@ -141,15 +141,45 @@ def train():
     feature_extractor = processor.feature_extractor
     tokenizer         = processor.tokenizer
 
+    # ── Language tokens for the 4 out-of-vocab languages (Paza approach) ──────
+    # kik/luo/mas/kln are NOT in Whisper's vocab. Giving each its own language
+    # token lets the model condition on the language instead of guessing it from
+    # acoustics. These 4 languages are 4/6 = 67% of the macro-averaged score.
+    NEW_LANG_TOKENS = ["<|kik|>", "<|luo|>", "<|mas|>", "<|kln|>"]
+    n_added = tokenizer.add_tokens(NEW_LANG_TOKENS, special_tokens=True)
+    print(f"Added {n_added} new language tokens (vocab now {len(tokenizer)}).")
+
+    SOT          = tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
+    TRANSCRIBE   = tokenizer.convert_tokens_to_ids("<|transcribe|>")
+    NOTIMESTAMPS = tokenizer.convert_tokens_to_ids("<|notimestamps|>")
+    EOT          = tokenizer.convert_tokens_to_ids("<|endoftext|>")
+
+    # ISO-639-3 → Whisper language token. swa/som reuse Whisper's native tokens;
+    # the 4 OOV languages use the tokens we just added.
+    LANG_TOKEN = {"swa": "<|sw|>", "som": "<|so|>",
+                  "kik": "<|kik|>", "luo": "<|luo|>",
+                  "mas": "<|mas|>", "kln": "<|kln|>"}
+
+    def build_labels(text, lang3):
+        """Label ids = [sot, <|lang|>, transcribe, notimestamps, ...text..., eot].
+        The exact layout Whisper expects — but works for OOV languages too, and
+        puts the language token at a fixed position so we can read it back for
+        per-language WER. Identical output to the old set_prefix_tokens path for
+        swa/som, so their caches stay valid."""
+        lang_id  = tokenizer.convert_tokens_to_ids(LANG_TOKEN[lang3])
+        text_ids = tokenizer(text, add_special_tokens=False).input_ids
+        return [SOT, lang_id, TRANSCRIBE, NOTIMESTAMPS] + text_ids + [EOT]
+
     # ── Swahili (cache-first, multi-shard) ───────────────────────────────────
-    SWA_TARGET = 8000
+    # Swahili is only 1/6 of the score and Whisper already handles it well —
+    # keep it modest so the OOV languages dominate the gradient.
+    SWA_TARGET = 3000
     SWA_CACHE  = f"{RECORDS_DIR}/swa_records.pkl"
     if os.path.exists(SWA_CACHE):
         swa_records = _load_records(SWA_CACHE)
         print(f"Swahili: {len(swa_records)} clips from cache.")
     else:
         swa_records = []
-        tokenizer.set_prefix_tokens(language="swahili", task="transcribe")
         for shard in range(10):
             if len(swa_records) >= SWA_TARGET:
                 break
@@ -204,7 +234,7 @@ def train():
                     except Exception:
                         continue
                     feats  = feature_extractor(arr, sampling_rate=16000).input_features[0].astype(np.float16)
-                    labels = tokenizer(wanted[base]).input_ids
+                    labels = build_labels(wanted[base], "swa")
                     swa_records.append({"input_features": feats, "labels": labels})
                     if len(swa_records) % 500 == 0:
                         print(f"  {len(swa_records)}/{SWA_TARGET}", flush=True)
@@ -216,7 +246,7 @@ def train():
 
     # ── Somali (cache-first, target-aware) ───────────────────────────────────
     SOM_CACHE  = f"{RECORDS_DIR}/som_records.pkl"
-    SOM_TARGET = 4000
+    SOM_TARGET = 3000
     _cached = _load_records(SOM_CACHE) if os.path.exists(SOM_CACHE) else []
     if len(_cached) >= SOM_TARGET:
         som_records = _cached
@@ -253,7 +283,6 @@ def train():
                 break
 
         som_records = []
-        tokenizer.set_prefix_tokens(language="somali", task="transcribe")
         for shard, wanted in wanted_by_shard.items():
             if len(som_records) >= SOM_TARGET:
                 break
@@ -278,7 +307,7 @@ def train():
                             except Exception:
                                 continue
                             feats  = feature_extractor(arr, sampling_rate=16000).input_features[0].astype(np.float16)
-                            labels = tokenizer(wanted[key]).input_ids
+                            labels = build_labels(wanted[key], "som")
                             som_records.append({"input_features": feats, "labels": labels})
                             if len(som_records) % 200 == 0:
                                 print(f"  {len(som_records)} Somali clips", flush=True)
@@ -295,7 +324,7 @@ def train():
     # ── ANV: Kikuyu, Luo, Maasai, Kalenjin (cache-first, target-aware) ───────
     ANV_CACHE    = f"{RECORDS_DIR}/anv_records.pkl"
     TARGET_LANGS = ["kik", "luo", "mas", "kln"]
-    ANV_TARGET   = 2000  # per language
+    ANV_TARGET   = 5000  # per language — these 4 OOV langs are 67% of the score
     _cached = _load_records(ANV_CACHE) if os.path.exists(ANV_CACHE) else []
     if len(_cached) >= ANV_TARGET * len(TARGET_LANGS):
         anv_records = _cached
@@ -315,8 +344,6 @@ def train():
         for lang, files in train_files.items():
             print(f"  {lang}: {len(files)} train shards")
 
-        # These languages are not in Whisper's vocab — train without language prefix
-        tokenizer.set_prefix_tokens(language=None, task="transcribe")
         buckets = {lang: [] for lang in TARGET_LANGS}
         for lang in TARGET_LANGS:
             print(f"\nLoading {lang}...")
@@ -346,7 +373,7 @@ def train():
                     except Exception:
                         continue
                     feats  = feature_extractor(arr, sampling_rate=16000).input_features[0].astype(np.float16)
-                    labels = tokenizer(text).input_ids
+                    labels = build_labels(text, lang)
                     buckets[lang].append({"input_features": feats, "labels": labels})
                 print(f"  {lang}: {len(buckets[lang])}/{ANV_TARGET}", flush=True)
 
@@ -367,13 +394,32 @@ def train():
         def __getitem__(self, i):
             return self.records[i]
 
-    all_records = swa_records + som_records + anv_records
     np.random.seed(42)
-    np.random.shuffle(all_records)
-    split    = int(0.95 * len(all_records))
-    train_ds = WhisperDataset(all_records[:split])
-    eval_ds  = WhisperDataset(all_records[split:])
-    print(f"\nTotal: {len(all_records)}  Train: {len(train_ds)}  Eval: {len(eval_ds)}")
+
+    def split_source(recs, cap=None):
+        """Shuffle, optionally cap to enforce the data mix, then 95/5 split.
+        Splitting per source guarantees every language is present in the dev set —
+        essential because the leaderboard is a macro-average (one bad language
+        tanks the mean)."""
+        recs = list(recs)
+        np.random.shuffle(recs)
+        if cap:
+            recs = recs[:cap]
+        n = int(0.95 * len(recs))
+        return recs[:n], recs[n:]
+
+    swa_tr, swa_ev = split_source(swa_records, cap=SWA_TARGET)
+    som_tr, som_ev = split_source(som_records, cap=SOM_TARGET)
+    anv_tr, anv_ev = split_source(anv_records)  # already capped per-language at load
+
+    train_records = swa_tr + som_tr + anv_tr
+    eval_records  = swa_ev + som_ev + anv_ev
+    np.random.shuffle(train_records)
+    train_ds = WhisperDataset(train_records)
+    eval_ds  = WhisperDataset(eval_records)
+    all_records = train_records + eval_records
+    print(f"\nData mix — swa:{len(swa_tr)} som:{len(som_tr)} anv:{len(anv_tr)}")
+    print(f"Total: {len(all_records)}  Train: {len(train_ds)}  Eval: {len(eval_ds)}")
 
     # ── Data collator + WER metric ────────────────────────────────────────────
     @dataclass
@@ -394,14 +440,30 @@ def train():
             return {"input_features": input_features, "labels": labels}
 
     wer_metric = evaluate.load("wer")
+    LANG_TOKEN_ID = {tokenizer.convert_tokens_to_ids(tok): l3
+                     for l3, tok in LANG_TOKEN.items()}
 
     def compute_metrics(pred):
         pred_ids  = pred.predictions
         label_ids = pred.label_ids
+        # Language = first label token (the collator strips <|sot|>, so column 0
+        # is the <|lang|> token). Capture it before -100 gets overwritten.
+        first_tok = label_ids[:, 0].copy()
         label_ids[label_ids == -100] = tokenizer.pad_token_id
         pred_str  = tokenizer.batch_decode(pred_ids,  skip_special_tokens=True)
         label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
-        return {"wer": round(wer_metric.compute(predictions=pred_str, references=label_str), 4)}
+        metrics = {"wer": round(wer_metric.compute(predictions=pred_str, references=label_str), 4)}
+        parts = []
+        for tok_id, l3 in LANG_TOKEN_ID.items():
+            idx = [i for i, t in enumerate(first_tok) if t == tok_id]
+            if idx:
+                w = round(wer_metric.compute(
+                    predictions=[pred_str[i] for i in idx],
+                    references =[label_str[i] for i in idx]), 4)
+                metrics[f"wer_{l3}"] = w
+                parts.append(f"{l3}={w:.3f}")
+        print("  per-language WER:  " + "  ".join(parts), flush=True)
+        return metrics
 
     data_collator = DataCollator(
         processor=processor,
@@ -413,6 +475,30 @@ def train():
     load_from = CHECKPOINT_DIR if os.path.exists(f"{CHECKPOINT_DIR}/config.json") else HF_REPO_ID
     print(f"Loading model from: {load_from}")
     model = WhisperForConditionalGeneration.from_pretrained(load_from, token=HF_TOKEN)
+
+    # Grow the embedding table for the 4 new language tokens. New rows are seeded
+    # from the Swahili (<|sw|>) embedding — a sensible point in "language-token
+    # space" that trains far faster than random init. Skipped (no-op) if the
+    # checkpoint already has these tokens, so we never clobber learned embeddings.
+    if model.get_input_embeddings().num_embeddings != len(tokenizer):
+        old_vocab = model.get_input_embeddings().num_embeddings
+        model.resize_token_embeddings(len(tokenizer))
+        with torch.no_grad():
+            emb   = model.get_input_embeddings().weight
+            sw_id = tokenizer.convert_tokens_to_ids("<|sw|>")
+            for tok in NEW_LANG_TOKENS:
+                emb[tokenizer.convert_tokens_to_ids(tok)] = emb[sw_id].clone()
+        print(f"Resized embeddings {old_vocab} -> {len(tokenizer)}; "
+              f"seeded new language tokens from <|sw|>.")
+
+    # SpecAugment — mask random time/frequency bands during training only
+    # (Whisper gates this on model.training, so inference is unaffected).
+    model.config.apply_spec_augment  = True
+    model.config.mask_time_prob      = 0.05
+    model.config.mask_time_length    = 10
+    model.config.mask_feature_prob   = 0.05
+    model.config.mask_feature_length = 10
+
     model.config.forced_decoder_ids            = None
     model.generation_config.forced_decoder_ids = None
     model.generation_config.suppress_tokens    = []
@@ -423,18 +509,18 @@ def train():
         output_dir                  = CHECKPOINT_DIR,
         per_device_train_batch_size = 16,
         gradient_accumulation_steps = 2,    # effective batch = 32
-        learning_rate               = 5e-6, # lower LR: fine-tuning a fine-tuned model
-        warmup_steps                = 100,
-        max_steps                   = 2000, # ~60 min on A100 with larger dataset
+        learning_rate               = 1e-5, # higher than R3's 5e-6: new random embeddings must move
+        warmup_steps                = 200,
+        max_steps                   = 2000, # ~2.5 epochs on the larger dataset
         gradient_checkpointing      = True,
         fp16                        = True,
         optim                       = "adafactor",
         eval_strategy               = "steps",
         per_device_eval_batch_size  = 8,
         predict_with_generate       = True,
-        generation_max_length       = 225,
-        save_steps                  = 300,
-        eval_steps                  = 300,
+        generation_max_length       = 64,   # match inference max_new_tokens=64 so best-checkpoint selection is honest
+        save_steps                  = 500,
+        eval_steps                  = 500,
         save_total_limit            = 3,
         logging_steps               = 50,
         load_best_model_at_end      = True,
@@ -455,10 +541,21 @@ def train():
         processing_class = feature_extractor,
     )
 
+    # Resume is now OPT-IN. A completed run leaves checkpoint-{max_steps} behind;
+    # silently resuming it makes the next run do ZERO steps (a wasted A100). And
+    # after a vocab change the old optimizer state is shape-incompatible anyway —
+    # so unless --resume is passed, wipe stale checkpoints and start the optimizer
+    # fresh from the loaded weights.
     checkpoint_dirs = sorted(glob.glob(f"{CHECKPOINT_DIR}/checkpoint-*"))
-    resume_from     = checkpoint_dirs[-1] if checkpoint_dirs else None
-    if resume_from:
+    if resume and checkpoint_dirs:
+        resume_from = checkpoint_dirs[-1]
         print(f"Resuming from {resume_from}")
+    else:
+        resume_from = None
+        for d in checkpoint_dirs:
+            shutil.rmtree(d, ignore_errors=True)
+        if checkpoint_dirs:
+            print(f"Cleared {len(checkpoint_dirs)} stale checkpoint dir(s) — fresh optimizer.")
     print("\nStarting training...")
     trainer.train(resume_from_checkpoint=resume_from)
     print("Training done.")
@@ -518,8 +615,10 @@ def run_inference(fresh: bool = False):
     ft_model.generation_config.max_length         = None
     print(f"Model ready on {device}.")
 
+    # Now that the model has dedicated tokens for the 4 OOV languages, force each
+    # one at inference (previously None → the decoder guessed and drifted to swa).
     LANG_TO_WHISPER = {"swa": "sw", "som": "so",
-                       "kik": None, "luo": None, "mas": None, "kln": None}
+                       "kik": "kik", "luo": "luo", "mas": "mas", "kln": "kln"}
 
     def transcribe_batch(arrays, language=None):
         arrays = [a[:480_000] for a in arrays]
@@ -669,10 +768,10 @@ def run_inference(fresh: bool = False):
 
 # ── Local entrypoint ─────────────────────────────────────────────────────────
 @app.local_entrypoint()
-def main(skip_train: bool = False, fresh: bool = False):
+def main(skip_train: bool = False, fresh: bool = False, resume: bool = False):
     if not skip_train:
         print("=== Step 1/2: Training ===")
-        train.remote()
+        train.remote(resume=resume)
     print("\n=== Inference ===")
     run_inference.remote(fresh=fresh)
     print("\nAll done! Download your submission:")

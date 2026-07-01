@@ -107,20 +107,20 @@ Loading 11,000 audio clips as float32 spectrograms requires ~10.5 GB of RAM. Sto
 | Inference fix attempt | Modal A100 | — (R2 weights) | — | 0.93813 | **+5.0% (normalisation backfired)** |
 | Kaggle experiment A | Kaggle T4 | TBD | — | *pending* | — |
 
-The metric is **average WER across all six languages** (unweighted mean). Lower is better. Round 3 regressed despite more data and more steps — see the post-mortem analysis below.
+The metric is the **unweighted mean of the per-language WER** — WER is computed independently for each of the six languages, then averaged. Each language contributes exactly **1/6 (16.7%)** of the final score, regardless of how many clips it has in the test set. Lower is better. Round 3 regressed despite more data and more steps — see the post-mortem analysis below.
 
 ### Per-Language Test Set Distribution
 
-| Language | Test clips | Share of test set |
-|---|---|---|
-| swa | 12,553 | 30.1% |
-| kik | 9,192 | 22.0% |
-| luo | 7,437 | 17.8% |
-| kln | 4,837 | 11.6% |
-| som | 3,925 | 9.4% |
-| mas | 3,789 | 9.1% |
+| Language | Test clips | Share of test set | Share of score |
+|---|---|---|---|
+| swa | 12,553 | 30.1% | 16.7% |
+| kik | 9,192 | 22.0% | 16.7% |
+| luo | 7,437 | 17.8% | 16.7% |
+| kln | 4,837 | 11.6% | 16.7% |
+| som | 3,925 | 9.4% | 16.7% |
+| mas | 3,789 | 9.1% | 16.7% |
 
-Swahili alone accounts for 30% of the leaderboard score, making it the single most important language for overall WER.
+Because scoring is a macro-average, **clip volume is irrelevant to the score** — every language weighs 1/6. Swahili and Somali are the only two languages Whisper knows from pre-training; Kikuyu, Luo, Maasai, and Kalenjin are out-of-vocabulary. **Those four OOV languages therefore account for 4/6 = 67% of the leaderboard score.** They — not the high-volume Swahili set — are where the competition is won or lost.
 
 ---
 
@@ -169,7 +169,7 @@ See the full [hardware validation report](hardware_validation.md).
 
 Round 3 made things worse (0.89330 → 0.91618). This is the most instructive failure of the project. After a thorough code audit, we identified five compounding causes:
 
-**1. Data distribution shift hurt the dominant language.**
+**1. Data distribution shift — but not in the way we first thought.**
 
 | Language | Round 2 clips | Round 2 % | Round 3 clips | Round 3 % |
 |---|---|---|---|---|
@@ -177,7 +177,7 @@ Round 3 made things worse (0.89330 → 0.91618). This is the most instructive fa
 | Somali | 2,000 | 16.7% | 4,000 | 22.3% |
 | ANV × 4 | 4,000 | 33.5% | 8,000 | 44.5% |
 
-Swahili — which accounts for 30% of the test leaderboard — saw its training proportion drop from half to a third. The model received more gradient signal toward the four ANV languages, which have no Whisper pretraining to anchor them. Continued fine-tuning on this skewed distribution eroded the strong Swahili representations Whisper already had from its 680k-hour pretraining. Swahili is disproportionately easy to learn from the pre-trained model and disproportionately damaging to lose.
+Our first reading blamed the drop in Swahili's share (half → a third). That reasoning was wrong: because the leaderboard is a **macro-average** (each language 1/6), shifting gradient toward the four OOV languages is the *correct* direction — Swahili is only 1/6 of the score and Whisper already handles it well. The real problem was not *which* way the mix shifted but that it shifted **while continuing to train a converged model at a low LR** (see cause 2), and that the eval/inference mismatch (cause 4) then selected a checkpoint that was not actually best at inference settings. The lesson for Round 4 is the opposite of our first instinct: deliberately weight the four OOV languages *up*, not protect Swahili.
 
 **2. Over-training a model that had already converged.**
 
@@ -197,7 +197,7 @@ For kik, luo, mas, and kln, `LANG_TO_WHISPER` maps to `None`, so inference runs 
 
 **What this tells us about the remaining road:**
 
-The biggest quick wins are not in more training data or more steps — they are in post-processing and decoding strategy. Specifically: (a) adding text normalisation to the inference output, (b) aligning `max_new_tokens` between eval and inference, and (c) investigating whether adding Whisper language-id tokens for ANV languages (via vocab extension) helps or hurts. The best current submission is still Round 2 (WER 0.89330).
+Because the score is a macro-average, **67% of it comes from the four OOV languages** (kik, luo, mas, kln) — so that is where effort belongs, not on the already-strong Swahili. The highest-value levers, ranked: (a) adding Whisper language-id tokens for the four OOV languages (vocab extension, Paza-style) so the model conditions on each one separately; (b) inverting the data mix to upsample the four OOV languages; (c) SpecAugment during training; (d) model-soup weight averaging to undo the regression at near-zero cost; and (e) aligning `max_new_tokens` between eval and inference. Note that text normalisation of the inference output was tested and **made WER worse** (0.89330 → 0.93813) — see "What Didn't Work" — so it is *not* a quick win. The best current submission is still Round 2 (WER 0.89330).
 
 ---
 
