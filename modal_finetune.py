@@ -6,6 +6,10 @@ import modal
 
 import os
 
+# Must be set BEFORE huggingface_hub is imported anywhere (it reads this at
+# import time) — setting it inside train() after the import was a no-op.
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
+
 # ── App + Image ───────────────────────────────────────────────────────────────
 app = modal.App("afrivoices-asr")
 
@@ -109,7 +113,7 @@ def _kaggle_download_dataset(dataset: str, kaggle_key: str, cache_dir: str) -> s
     secrets=secrets,
     memory=65536,
 )
-def train(resume: bool = False):
+def train(resume: bool = False, fresh: bool = False):
     import io, json, tarfile, lzma, shutil
     import numpy as np
     import pandas as pd
@@ -244,146 +248,154 @@ def train(resume: bool = False):
         _save_records(swa_records, SWA_CACHE)
         vol.commit()
 
-    # ── Somali (cache-first, target-aware) ───────────────────────────────────
-    SOM_CACHE  = f"{RECORDS_DIR}/som_records.pkl"
-    SOM_TARGET = 3000
-    _cached = _load_records(SOM_CACHE) if os.path.exists(SOM_CACHE) else []
-    if len(_cached) >= SOM_TARGET:
-        som_records = _cached
-        print(f"Somali: {len(som_records)} clips from cache.")
-    else:
-        if _cached:
-            print(f"Cache has {len(_cached)} clips, need {SOM_TARGET}. Re-downloading...")
-            os.remove(SOM_CACHE)
-        print("Scanning Somali manifests from HF Hub...")
-        wanted_by_shard = {}
-        total_wanted    = 0
-        for shard in range(171):
-            manifest_path = hf_hub_download(
-                repo_id="DigitalUmuganda/Afrivoice",
-                filename=f"Somali/manifest_{shard}.json",
-                repo_type="dataset", token=HF_TOKEN,
-            )
-            with open(manifest_path) as f:
-                entries = [json.loads(line) for line in f if line.strip()]
-            shard_wanted = {}
-            for entry in entries:
-                text = (entry.get("transcription") or
-                        entry.get("normalized_transcription") or "").strip()
-                key  = os.path.splitext(
-                    os.path.basename(str(entry.get("audio_filepath", "")))
-                )[0]
-                if text and key:
-                    shard_wanted[key] = text
-            if shard_wanted:
-                wanted_by_shard[shard] = shard_wanted
-                total_wanted += len(shard_wanted)
-                print(f"  shard {shard}: {len(shard_wanted)} valid (total: {total_wanted})", flush=True)
-            if total_wanted >= SOM_TARGET:
-                break
+    # ── ANV: Kikuyu, Luo, Maasai, Kalenjin, Somali (Maxatire) ─────────────────
+    # All 5 non-Swahili languages come from anv_data_ke. Two grounded changes:
+    #   1. Include UNSCRIPTED (spontaneous) speech, not just scripted. The test set
+    #      is spontaneous-dominated (official hours e.g. mas 51h read / 454h spont);
+    #      training scripted-only was a train/test mismatch.
+    #   2. Somali sourced here (Maxatire dialect) instead of DigitalUmuganda
+    #      (Mogadishu) — the ANV test Somali is Maxatire.
+    # Whisper caps at 30s (1500 frames); unscripted clips average ~34s, so we SKIP
+    # any clip >30s (its transcript would not align to a truncated 30s window).
+    MAX_SAMPLES = 480_000                               # 30s @ 16kHz — hard Whisper limit
+    # (scripted, unscripted) targets. Unscripted spontaneous clips average ~34s and
+    # MANY exceed Whisper's 30s limit (measured: skip rate climbs past 80% on later
+    # shards). Harvesting to a high unscripted target would download 100s of GB of
+    # 250-600MB shards mostly to discard >30s clips — so unscripted is bounded by
+    # MAX_UNSCRIPTED_SHARDS below (takes whatever ≤30s clips the early shards yield).
+    ANV_TARGETS = {
+        "kik": (3000, 2500), "luo": (3000, 2500), "kln": (3000, 2500),
+        "mas": (2500, 2500), "som": (3000, 2500),   # som = Maxatire dialect
+    }
+    MAX_UNSCRIPTED_SHARDS = 30
+    ANV_LANGS  = list(ANV_TARGETS.keys())
+    # One cache PER LANGUAGE, committed as soon as that language finishes — a hang
+    # or crash mid-harvest now costs at most one language, not the whole run.
+    # (Delete a language's pkl to force its re-harvest.)
+    def _lang_cache(lang):
+        return f"{RECORDS_DIR}/anv_{lang}_v2.pkl"
 
-        som_records = []
-        for shard, wanted in wanted_by_shard.items():
-            if len(som_records) >= SOM_TARGET:
-                break
-            for attempt in range(2):
-                audio_tar = hf_hub_download(
-                    repo_id="DigitalUmuganda/Afrivoice",
-                    filename=f"Somali/audio_shards/audio_{shard}.tar.xz",
-                    repo_type="dataset", token=HF_TOKEN,
-                    force_download=(attempt > 0),
-                )
-                try:
-                    with tarfile.open(audio_tar, "r:xz") as tar:
-                        for member in tar:
-                            if member.isdir():
-                                continue
-                            key = os.path.splitext(os.path.basename(member.name))[0]
-                            if key not in wanted:
-                                continue
-                            try:
-                                arr = _decode_audio({"bytes": tar.extractfile(member).read()})
-                                arr = arr[:480_000]
-                            except Exception:
-                                continue
-                            feats  = feature_extractor(arr, sampling_rate=16000).input_features[0].astype(np.float16)
-                            labels = build_labels(wanted[key], "som")
-                            som_records.append({"input_features": feats, "labels": labels})
-                            if len(som_records) % 200 == 0:
-                                print(f"  {len(som_records)} Somali clips", flush=True)
-                            if len(som_records) >= SOM_TARGET:
-                                break
-                    break
-                except (lzma.LZMAError, tarfile.TarError) as e:
-                    print(f"  Shard {shard} corrupt (attempt {attempt+1}): {e}")
-
-        print(f"Somali: {len(som_records)} clips ready.")
-        _save_records(som_records, SOM_CACHE)
-        vol.commit()
-
-    # ── ANV: Kikuyu, Luo, Maasai, Kalenjin (cache-first, target-aware) ───────
-    ANV_CACHE    = f"{RECORDS_DIR}/anv_records.pkl"
-    TARGET_LANGS = ["kik", "luo", "mas", "kln"]
-    ANV_TARGET   = 5000  # per language — these 4 OOV langs are 67% of the score
-    _cached = _load_records(ANV_CACHE) if os.path.exists(ANV_CACHE) else []
-    if len(_cached) >= ANV_TARGET * len(TARGET_LANGS):
-        anv_records = _cached
-        print(f"ANV: {len(anv_records)} clips from cache.")
-    else:
-        if _cached:
-            print(f"Cache has {len(_cached)} clips, need {ANV_TARGET * len(TARGET_LANGS)}. Re-downloading...")
-            os.remove(ANV_CACHE)
+    anv_records = []
+    missing = []
+    for l in ANV_LANGS:
+        if os.path.exists(_lang_cache(l)):
+            recs = _load_records(_lang_cache(l))
+            anv_records += recs
+            print(f"ANV {l}: {len(recs)} clips from cache.")
+        else:
+            missing.append(l)
+    if missing:
+        print(f"Harvesting: {missing}")
         print("Listing MCAA1-MSU/anv_data_ke on HF Hub...")
         all_files     = list(list_repo_files("MCAA1-MSU/anv_data_ke", repo_type="dataset", token=HF_TOKEN))
-        parquet_files = sorted([f for f in all_files if f.endswith(".parquet")])
-        train_files   = {lang: [] for lang in TARGET_LANGS}
+        parquet_files = sorted(f for f in all_files if f.endswith(".parquet"))
+        # path = {lang}/train/{scripted|unscripted}/audios/*.parquet
+        shards = {(l, sub): [] for l in ANV_LANGS for sub in ("scripted", "unscripted")}
         for f in parquet_files:
-            parts = f.split("/")
-            if parts[0] in TARGET_LANGS and parts[1] == "train":
-                train_files[parts[0]].append(f)
-        for lang, files in train_files.items():
-            print(f"  {lang}: {len(files)} train shards")
+            p = f.split("/")
+            if len(p) >= 3 and p[0] in ANV_LANGS and p[1] == "train" and p[2] in ("scripted", "unscripted"):
+                shards[(p[0], p[2])].append(f)
+        for k in sorted(shards):
+            print(f"  {k[0]}/{k[1]}: {len(shards[k])} shards")
 
-        buckets = {lang: [] for lang in TARGET_LANGS}
-        for lang in TARGET_LANGS:
-            print(f"\nLoading {lang}...")
-            for shard_path in train_files[lang]:
-                if len(buckets[lang]) >= ANV_TARGET:
-                    break
-                pq_path = hf_hub_download(
-                    repo_id="MCAA1-MSU/anv_data_ke",
-                    filename=shard_path,
-                    repo_type="dataset", token=HF_TOKEN,
-                )
-                df   = pd.read_parquet(pq_path)
-                tcol = ("transcription"  if "transcription"  in df.columns else
-                        "actualSentence" if "actualSentence" in df.columns else
-                        "transcript"     if "transcript"     in df.columns else None)
-                if tcol is None:
-                    continue
-                for _, row in df.iterrows():
-                    if len(buckets[lang]) >= ANV_TARGET:
-                        break
-                    text = (row.get(tcol) or "").strip()
-                    if not text:
-                        continue
+        import tempfile, shutil as _sh
+        import soundfile as _sf
+
+        import concurrent.futures as _cf
+
+        def _dl_shard(shard_path, td):
+            """Download with a HARD 10-min wall-clock cap per attempt. A trickling
+            transfer (bytes dripping too slowly to ever hit a socket read-timeout)
+            is the failure mode that froze two runs — only a wall-clock cap catches
+            it. Each attempt uses a fresh subdir so a zombie attempt's file locks
+            can't block the retry. After 3 failed attempts the shard is skipped."""
+            for attempt in range(3):
+                sub = os.path.join(td, f"try{attempt}")
+                ex  = _cf.ThreadPoolExecutor(max_workers=1)
+                try:
+                    fut = ex.submit(hf_hub_download, repo_id="MCAA1-MSU/anv_data_ke",
+                                    filename=shard_path, repo_type="dataset",
+                                    token=HF_TOKEN, local_dir=sub)
+                    return fut.result(timeout=600)
+                except Exception as e:
+                    print(f"    download attempt {attempt+1} failed ({type(e).__name__}): {str(e)[:80]}", flush=True)
+                finally:
+                    ex.shutdown(wait=False)
+            return None
+
+        def _too_long(audio_field):
+            """Duration from the audio HEADER when possible — skipping a >30s clip
+            then costs ~nothing instead of a full waveform decode (≈2/3 of
+            unscripted clips are >30s, so this roughly halves harvest time)."""
+            if isinstance(audio_field, dict):
+                arr = audio_field.get("array")
+                if arr is not None:
+                    sr = audio_field.get("sampling_rate") or 16000
+                    return len(arr) / sr > 30.0
+                raw = audio_field.get("bytes")
+                if raw:
                     try:
-                        arr = _decode_audio(row["audio"])
-                        arr = arr[:480_000]
+                        info = _sf.info(io.BytesIO(raw))
+                        return info.frames / info.samplerate > 30.0
                     except Exception:
-                        continue
-                    feats  = feature_extractor(arr, sampling_rate=16000).input_features[0].astype(np.float16)
-                    labels = build_labels(text, lang)
-                    buckets[lang].append({"input_features": feats, "labels": labels})
-                print(f"  {lang}: {len(buckets[lang])}/{ANV_TARGET}", flush=True)
+                        return None   # header unreadable — decide after decode
+            return None
 
-        anv_records = []
-        for lang, recs in buckets.items():
-            print(f"  {lang}: {len(recs)} clips")
-            anv_records.extend(recs)
-        print(f"ANV total: {len(anv_records)} clips ready.")
-        _save_records(anv_records, ANV_CACHE)
-        vol.commit()
+        def harvest(lang, subtype, target, max_shards=None):
+            recs, skipped_long = [], 0
+            slist = shards[(lang, subtype)]
+            if max_shards:
+                slist = slist[:max_shards]   # bound cost; unscripted shards are huge
+            for shard_path in slist:
+                if len(recs) >= target:
+                    break
+                td = tempfile.mkdtemp()
+                try:
+                    pq_path = _dl_shard(shard_path, td)
+                    if pq_path is None:
+                        print(f"    skipping shard after 3 failed downloads", flush=True)
+                        continue
+                    df   = pd.read_parquet(pq_path)
+                    tcol = ("transcription"  if "transcription"  in df.columns else
+                            "actualSentence" if "actualSentence" in df.columns else
+                            "transcript"     if "transcript"     in df.columns else None)
+                    if tcol is None:
+                        continue
+                    for _, row in df.iterrows():
+                        if len(recs) >= target:
+                            break
+                        text = (row.get(tcol) or "").strip()
+                        if not text:
+                            continue
+                        long = _too_long(row["audio"])
+                        if long:                        # cheap header check, no decode
+                            skipped_long += 1
+                            continue
+                        try:
+                            arr = _decode_audio(row["audio"])
+                        except Exception:
+                            continue
+                        if len(arr) > MAX_SAMPLES:      # >30s: transcript won't align to 30s window
+                            skipped_long += 1
+                            continue
+                        feats = feature_extractor(arr, sampling_rate=16000).input_features[0].astype(np.float16)
+                        recs.append({"input_features": feats, "labels": build_labels(text, lang)})
+                finally:
+                    _sh.rmtree(td, ignore_errors=True)   # audio-heavy parquets — free disk each shard
+                print(f"  {lang}/{subtype}: {len(recs)}/{target}  (skipped >30s: {skipped_long})", flush=True)
+            return recs
+
+        for lang in missing:
+            st, ut = ANV_TARGETS[lang]
+            print(f"\nLoading {lang}: scripted<={st}, unscripted<={ut}")
+            sc = harvest(lang, "scripted", st)
+            un = harvest(lang, "unscripted", ut, max_shards=MAX_UNSCRIPTED_SHARDS)
+            lang_recs = sc + un
+            print(f"  {lang}: {len(sc)} scripted + {len(un)} unscripted = {len(lang_recs)}")
+            _save_records(lang_recs, _lang_cache(lang))
+            vol.commit()                                 # survive stalls/crashes per language
+            anv_records += lang_recs
+    print(f"ANV total: {len(anv_records)} clips ready.")
 
     # ── Combined dataset + train/eval split ───────────────────────────────────
     class WhisperDataset(TorchDataset):
@@ -409,16 +421,15 @@ def train(resume: bool = False):
         return recs[:n], recs[n:]
 
     swa_tr, swa_ev = split_source(swa_records, cap=SWA_TARGET)
-    som_tr, som_ev = split_source(som_records, cap=SOM_TARGET)
-    anv_tr, anv_ev = split_source(anv_records)  # already capped per-language at load
+    anv_tr, anv_ev = split_source(anv_records)  # kik/luo/mas/kln/som, already capped at load
 
-    train_records = swa_tr + som_tr + anv_tr
-    eval_records  = swa_ev + som_ev + anv_ev
+    train_records = swa_tr + anv_tr
+    eval_records  = swa_ev + anv_ev
     np.random.shuffle(train_records)
     train_ds = WhisperDataset(train_records)
     eval_ds  = WhisperDataset(eval_records)
     all_records = train_records + eval_records
-    print(f"\nData mix — swa:{len(swa_tr)} som:{len(som_tr)} anv:{len(anv_tr)}")
+    print(f"\nData mix — swa:{len(swa_tr)} anv(5 langs):{len(anv_tr)}")
     print(f"Total: {len(all_records)}  Train: {len(train_ds)}  Eval: {len(eval_ds)}")
 
     # ── Data collator + WER metric ────────────────────────────────────────────
@@ -472,7 +483,13 @@ def train(resume: bool = False):
 
     # ── Model (continue from fine-tuned checkpoint, not base model) ──────────
     vol.reload()
-    load_from = CHECKPOINT_DIR if os.path.exists(f"{CHECKPOINT_DIR}/config.json") else HF_REPO_ID
+    # --fresh forces a clean fine-tune from base whisper-small (correct when the
+    # data composition changes materially, as in the scripted+unscripted overhaul).
+    # The embedding-resize/seed block below adds our 4 OOV tokens on top of base.
+    if fresh:
+        load_from = "openai/whisper-small"
+    else:
+        load_from = CHECKPOINT_DIR if os.path.exists(f"{CHECKPOINT_DIR}/config.json") else HF_REPO_ID
     print(f"Loading model from: {load_from}")
     model = WhisperForConditionalGeneration.from_pretrained(load_from, token=HF_TOKEN)
 
@@ -504,14 +521,17 @@ def train(resume: bool = False):
     model.generation_config.suppress_tokens    = []
     print(f"Model: {sum(p.numel() for p in model.parameters())/1e6:.0f}M parameters")
 
+    # Match inference decoding so best-checkpoint selection is honest (see run_inference).
+    model.generation_config.no_repeat_ngram_size = 3
+
     # ── Training args ─────────────────────────────────────────────────────────
     training_args = Seq2SeqTrainingArguments(
         output_dir                  = CHECKPOINT_DIR,
         per_device_train_batch_size = 16,
         gradient_accumulation_steps = 2,    # effective batch = 32
         learning_rate               = 1e-5, # higher than R3's 5e-6: new random embeddings must move
-        warmup_steps                = 200,
-        max_steps                   = 2000, # ~2.5 epochs on the larger dataset
+        warmup_steps                = 400,
+        max_steps                   = 3000, # ~3 epochs over ~29k clips; load_best picks the peak
         gradient_checkpointing      = True,
         fp16                        = True,
         optim                       = "adafactor",
@@ -519,8 +539,9 @@ def train(resume: bool = False):
         per_device_eval_batch_size  = 8,
         predict_with_generate       = True,
         generation_max_length       = 64,   # match inference max_new_tokens=64 so best-checkpoint selection is honest
+        generation_num_beams        = 5,     # match inference beam search
         save_steps                  = 500,
-        eval_steps                  = 500,
+        eval_steps                  = 500,   # ~6 evals over 3000 steps
         save_total_limit            = 3,
         logging_steps               = 50,
         load_best_model_at_end      = True,
@@ -624,7 +645,11 @@ def run_inference(fresh: bool = False):
         arrays = [a[:480_000] for a in arrays]
         inputs = ft_processor(arrays, sampling_rate=16000, return_tensors="pt")\
                    .input_features.to(device).to(torch.float16)
-        gen_kw = {"max_new_tokens": 64}
+        # Anti-hallucination decoding. The Round-4 CSV showed ~6% of Somali rows were
+        # degenerate repetition loops ("oo oo oo …" ×50), each scoring WER 5-8 and
+        # inflating Somali's macro WER. Beam search + no-repeat-3gram kill these loops.
+        # Both are edge-safe (no_repeat is free on CPU; use num_beams=1 for the Pi report).
+        gen_kw = {"max_new_tokens": 64, "num_beams": 5, "no_repeat_ngram_size": 3}
         if language:
             lid = ft_processor.tokenizer.convert_tokens_to_ids(f"<|{language}|>")
             tid = ft_processor.tokenizer.convert_tokens_to_ids("<|transcribe|>")
@@ -771,7 +796,7 @@ def run_inference(fresh: bool = False):
 def main(skip_train: bool = False, fresh: bool = False, resume: bool = False):
     if not skip_train:
         print("=== Step 1/2: Training ===")
-        train.remote(resume=resume)
+        train.remote(resume=resume, fresh=fresh)
     print("\n=== Inference ===")
     run_inference.remote(fresh=fresh)
     print("\nAll done! Download your submission:")

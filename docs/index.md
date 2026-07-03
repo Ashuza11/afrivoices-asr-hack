@@ -40,7 +40,7 @@ The dataset is a mix of **scripted (read) speech** and **unscripted (spontaneous
 
 We fine-tune [openai/whisper-small](https://huggingface.co/openai/whisper-small), a 244M-parameter encoder-decoder model pre-trained by OpenAI on 680,000 hours of multilingual speech. Whisper already knows Swahili (`<|sw|>`) and Somali (`<|so|>`), giving us strong priors for two of the six languages out of the box.
 
-For the four languages not in Whisper's vocabulary (Kikuyu, Luo, Maasai, Kalenjin), we fine-tune **without a language prefix token** — the model learns to transcribe them directly from acoustic features.
+For the four languages not in Whisper's vocabulary (Kikuyu, Luo, Maasai, Kalenjin), we **extend Whisper's vocabulary** with four new language tokens — `<|kik|>`, `<|luo|>`, `<|mas|>`, `<|kln|>` — each initialised from the pre-trained Swahili (`<|sw|>`) embedding. This lets the decoder condition on each language explicitly at both training and inference, rather than free-decoding and drifting toward the dominant training language. (Rounds 1–3 used no language prefix for these four; adding the tokens in Round 4 was the single biggest score improvement of the project.)
 
 Why Whisper-small and not a larger model?
 
@@ -69,10 +69,16 @@ All datasets are licensed under CC BY 4.0 and are publicly available on Hugging 
 - Same data composition as Round 1
 - Result: WER **0.89330** on public leaderboard (−44.6% vs baseline)
 
-**Round 3 (Modal A100, 2,000 steps from Round 2 checkpoint) — in progress:**
+**Round 3 (Modal A100, 2,000 steps from Round 2 checkpoint):**
 - 8,000 Swahili + 4,000 Somali + 2,000 × 4 ANV = **~20,000 clips**
 - Learning rate lowered to 5e-6 (fine-tuning a fine-tuned model)
-- *Results pending*
+- Result: WER **0.91618** — a regression (see post-mortem)
+
+**Round 4 (Modal A100, fresh from base whisper-small, best checkpoint at step 1,000):**
+- 3,000 Swahili + 3,000 Somali + 5,000 × 4 OOV = **~26,000 clips** — data mix *inverted* to favour the four OOV languages that make up 67% of the macro-averaged score
+- Four new language tokens added and seeded from `<|sw|>`; SpecAugment enabled; `generation_max_length` aligned to inference `max_new_tokens=64`
+- Learning rate 1e-5, warmup 200 steps
+- Result: WER **0.81989** — best submission, −8.2% relative vs Round 2
 
 ### Training Infrastructure
 
@@ -103,11 +109,11 @@ Loading 11,000 audio clips as float32 spectrograms requires ~10.5 GB of RAM. Sto
 | Zero-shot whisper-small | — | — | — | 1.61077 | baseline |
 | Round 1 fine-tune | Colab T4 | 600 | — | *(inference crashed)* | — |
 | Round 2 fine-tune | Modal A100 | 1,500 | — | **0.89330** | −44.6% |
-| Round 3 fine-tune | Modal A100 | +2,000 from R2 ckpt | 0.5442 | 0.91618 | **+2.6% (regression)** |
-| Inference fix attempt | Modal A100 | — (R2 weights) | — | 0.93813 | **+5.0% (normalisation backfired)** |
-| Kaggle experiment A | Kaggle T4 | TBD | — | *pending* | — |
+| Round 3 fine-tune | Modal A100 | +2,000 from R2 ckpt | 0.5442 | 0.91618 | +2.6% (regression) |
+| Inference fix attempt | Modal A100 | — (R2 weights) | — | 0.93813 | +5.0% (normalisation backfired) |
+| **Round 4 fine-tune** | Modal A100 | 1,000 (best ckpt) | — | **0.81989** | **−8.2% vs R2 (best)** |
 
-The metric is the **unweighted mean of the per-language WER** — WER is computed independently for each of the six languages, then averaged. Each language contributes exactly **1/6 (16.7%)** of the final score, regardless of how many clips it has in the test set. Lower is better. Round 3 regressed despite more data and more steps — see the post-mortem analysis below.
+The metric is the **unweighted mean of the per-language WER** — WER is computed independently for each of the six languages, then averaged. Each language contributes exactly **1/6 (16.7%)** of the final score, regardless of how many clips it has in the test set. Lower is better. Round 3 regressed despite more data and more steps; Round 4 then broke through to **0.81989** by inverting the data mix toward the OOV languages and giving them dedicated language tokens — validating the macro-average analysis below.
 
 ### Per-Language Test Set Distribution
 
@@ -197,7 +203,26 @@ For kik, luo, mas, and kln, `LANG_TO_WHISPER` maps to `None`, so inference runs 
 
 **What this tells us about the remaining road:**
 
-Because the score is a macro-average, **67% of it comes from the four OOV languages** (kik, luo, mas, kln) — so that is where effort belongs, not on the already-strong Swahili. The highest-value levers, ranked: (a) adding Whisper language-id tokens for the four OOV languages (vocab extension, Paza-style) so the model conditions on each one separately; (b) inverting the data mix to upsample the four OOV languages; (c) SpecAugment during training; (d) model-soup weight averaging to undo the regression at near-zero cost; and (e) aligning `max_new_tokens` between eval and inference. Note that text normalisation of the inference output was tested and **made WER worse** (0.89330 → 0.93813) — see "What Didn't Work" — so it is *not* a quick win. The best current submission is still Round 2 (WER 0.89330).
+Because the score is a macro-average, **67% of it comes from the four OOV languages** (kik, luo, mas, kln) — so that is where effort belongs, not on the already-strong Swahili. The highest-value levers, ranked: (a) adding Whisper language-id tokens for the four OOV languages (vocab extension, Paza-style) so the model conditions on each one separately; (b) inverting the data mix to upsample the four OOV languages; (c) SpecAugment during training; (d) model-soup weight averaging to undo the regression at near-zero cost; and (e) aligning `max_new_tokens` between eval and inference. Note that text normalisation of the inference output was tested and **made WER worse** (0.89330 → 0.93813) — see "What Didn't Work" — so it is *not* a quick win. **Round 4 implemented levers (a), (b), (c) and (e) together and scored 0.81989 — an 8.2% relative gain and the new best submission** — confirming that the four OOV languages were indeed the place to spend effort.
+
+### Round 4: What Worked
+
+Round 4 was the first deliberate application of the macro-average insight, and it delivered the largest single-round gain since the initial fine-tune (0.89330 → **0.81989**, −8.2% relative). Four changes shipped together:
+
+1. **Dedicated language tokens for the four OOV languages**, seeded from `<|sw|>`. Almost certainly the dominant contributor: at inference the decoder is now *forced* onto the correct language instead of free-decoding toward Swahili-like output for ambiguous utterances.
+2. **Inverted data mix** — 5,000 clips per OOV language vs 3,000 for Swahili/Somali — putting gradient where 67% of the score lives.
+3. **SpecAugment** regularisation (train-only, no inference cost).
+4. **Eval/inference generation-length alignment** (`generation_max_length = max_new_tokens = 64`), so `load_best_model_at_end` selects a checkpoint that is genuinely best under deployment conditions.
+
+On the held-out dev set the model peaked at **step 1,000** (macro dev WER ≈ 0.98) and then over-trained — the same pattern as Round 3 — but this time `load_best_model_at_end` correctly deployed the step-1,000 checkpoint rather than the degraded final one. Notably the **leaderboard score (0.820) was better than the dev macro (0.98)**, because dev eval free-decodes while inference forces the language token: the forced-decoding benefit for the OOV languages only materialises at test time.
+
+**Where the score is still being lost.** Per-language dev WER at the deployed checkpoint:
+
+| lang | swa | kln | luo | kik | mas | som |
+|---|---|---|---|---|---|---|
+| dev WER | 0.82 | 0.85 | 0.91 | 0.99 | 1.10 | **1.23** |
+
+Somali is the clear outlier — WER > 1 means the model is *inserting* words (hallucinating / looping), even though Somali is a Whisper-native language. Maasai is second-worst. Under a macro-average these two languages drag the mean up more than any other lever can pull it down, so they are the focus of Round 5.
 
 ---
 
