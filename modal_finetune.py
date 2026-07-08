@@ -105,15 +105,11 @@ def _kaggle_download_dataset(dataset: str, kaggle_key: str, cache_dir: str) -> s
 
 
 # ── Train ─────────────────────────────────────────────────────────────────────
-@app.function(
-    gpu="A100",
-    image=image,
-    timeout=int(5.5 * 3600),
-    volumes={VOL_PATH: vol},
-    secrets=secrets,
-    memory=65536,
-)
-def train(resume: bool = False, fresh: bool = False):
+# _train_impl holds the full pipeline; two thin Modal wrappers below give it two
+# billing profiles: prepare_data() runs the data harvest on a cheap CPU container
+# (a stalled download burns cents), train() runs on the A100 only once the caches
+# exist (the GPU never idles on network I/O — that mistake cost us ~$15).
+def _train_impl(resume: bool = False, fresh: bool = False, data_only: bool = False):
     import io, json, tarfile, lzma, shutil
     import numpy as np
     import pandas as pd
@@ -397,6 +393,10 @@ def train(resume: bool = False, fresh: bool = False):
             anv_records += lang_recs
     print(f"ANV total: {len(anv_records)} clips ready.")
 
+    if data_only:
+        print("Data preparation complete — all caches committed to the volume.")
+        return
+
     # ── Combined dataset + train/eval split ───────────────────────────────────
     class WhisperDataset(TorchDataset):
         def __init__(self, records):
@@ -405,6 +405,20 @@ def train(resume: bool = False, fresh: bool = False):
             return len(self.records)
         def __getitem__(self, i):
             return self.records[i]
+
+    # Whisper's decoder hard-caps labels at 448 tokens (max_target_positions).
+    # Spontaneous transcripts + byte-level tokenization of the OOV languages can
+    # exceed it (crashed at step 188 with 471). Drop those clips — truncating the
+    # transcript would teach the model to stop mid-utterance.
+    MAX_LABEL_LEN = 448
+    def _drop_overlong(recs, name):
+        kept = [r for r in recs if len(r["labels"]) <= MAX_LABEL_LEN]
+        if len(kept) < len(recs):
+            print(f"  {name}: dropped {len(recs) - len(kept)} clips with >"
+                  f"{MAX_LABEL_LEN}-token labels")
+        return kept
+    swa_records = _drop_overlong(swa_records, "swa")
+    anv_records = _drop_overlong(anv_records, "anv")
 
     np.random.seed(42)
 
@@ -539,9 +553,9 @@ def train(resume: bool = False, fresh: bool = False):
         per_device_eval_batch_size  = 8,
         predict_with_generate       = True,
         generation_max_length       = 64,   # match inference max_new_tokens=64 so best-checkpoint selection is honest
-        generation_num_beams        = 5,     # match inference beam search
-        save_steps                  = 500,
-        eval_steps                  = 500,   # ~6 evals over 3000 steps
+        generation_num_beams        = 3,     # match inference beam search
+        save_steps                  = 750,
+        eval_steps                  = 750,   # 4 evals over 3000 steps — beam evals cost A100 time
         save_total_limit            = 3,
         logging_steps               = 50,
         load_best_model_at_end      = True,
@@ -594,6 +608,32 @@ def train(resume: bool = False, fresh: bool = False):
     model.push_to_hub(repo_id, token=HF_TOKEN)
     processor.push_to_hub(repo_id, token=HF_TOKEN)
     print(f"Pushed to HF Hub: https://huggingface.co/{repo_id}")
+
+
+@app.function(
+    image=image,
+    timeout=int(4 * 3600),
+    volumes={VOL_PATH: vol},
+    secrets=secrets,
+    cpu=4,
+    memory=32768,
+)
+def prepare_data():
+    """Data harvest on a CPU-only container (~$1.3/hr vs ~$3+/hr for the A100
+    stack). Populates the per-language caches on the volume, then exits."""
+    _train_impl(data_only=True)
+
+
+@app.function(
+    gpu="A100",
+    image=image,
+    timeout=int(5.5 * 3600),
+    volumes={VOL_PATH: vol},
+    secrets=secrets,
+    memory=65536,
+)
+def train(resume: bool = False, fresh: bool = False):
+    _train_impl(resume=resume, fresh=fresh)
 
 
 # ── Inference ─────────────────────────────────────────────────────────────────
@@ -649,7 +689,7 @@ def run_inference(fresh: bool = False):
         # degenerate repetition loops ("oo oo oo …" ×50), each scoring WER 5-8 and
         # inflating Somali's macro WER. Beam search + no-repeat-3gram kill these loops.
         # Both are edge-safe (no_repeat is free on CPU; use num_beams=1 for the Pi report).
-        gen_kw = {"max_new_tokens": 64, "num_beams": 5, "no_repeat_ngram_size": 3}
+        gen_kw = {"max_new_tokens": 64, "num_beams": 3, "no_repeat_ngram_size": 3}
         if language:
             lid = ft_processor.tokenizer.convert_tokens_to_ids(f"<|{language}|>")
             tid = ft_processor.tokenizer.convert_tokens_to_ids("<|transcribe|>")
@@ -795,7 +835,9 @@ def run_inference(fresh: bool = False):
 @app.local_entrypoint()
 def main(skip_train: bool = False, fresh: bool = False, resume: bool = False):
     if not skip_train:
-        print("=== Step 1/2: Training ===")
+        print("=== Step 0: Data preparation (CPU container — no GPU billing) ===")
+        prepare_data.remote()
+        print("=== Step 1/2: Training (A100 starts only now) ===")
         train.remote(resume=resume, fresh=fresh)
     print("\n=== Inference ===")
     run_inference.remote(fresh=fresh)

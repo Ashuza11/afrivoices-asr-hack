@@ -23,6 +23,7 @@ data/*.tar.xz
 
 # Kaggle output
 submission.csv
+submission_*.csv
 wandb/
 
 # Internal planning doc
