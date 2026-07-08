@@ -318,13 +318,15 @@ def load_swahili():
     target = SCRIPTED_TARGETS["swa"]
     if os.path.exists(cache):
         recs = load_records(cache)
-        print(f"Swahili from cache: {len(recs)}")
+        print(f"Swahili from cache: {len(recs)}", flush=True)
         return recs[:target]
 
     records = []
+    print(f"Loading Swahili target={target}", flush=True)
     for shard in range(10):
         if len(records) >= target:
             break
+        print(f"Swahili shard {shard}: downloading manifest/audio if not cached", flush=True)
         try:
             manifest_path = hf_hub_download(
                 repo_id="DigitalUmuganda/Afrivoice_Swahili",
@@ -339,7 +341,7 @@ def load_swahili():
                 token=HF_TOKEN,
             )
         except Exception as e:
-            print(f"Swahili shard {shard} unavailable: {e}")
+            print(f"Swahili shard {shard} unavailable: {e}", flush=True)
             break
 
         with open(manifest_path) as f:
@@ -360,9 +362,21 @@ def load_swahili():
                 wanted[os.path.basename(key)] = text
 
         with tarfile.open(audio_tar, "r:xz") as tar:
-            for member in tar.getmembers():
+            members = tar.getmembers()
+            print(
+                f"Swahili shard {shard}: scanning {len(members)} tar members "
+                f"against {len(wanted)} manifest keys",
+                flush=True,
+            )
+            for member_idx, member in enumerate(members):
                 if len(records) >= target:
                     break
+                if member_idx and member_idx % 5000 == 0:
+                    print(
+                        f"Swahili shard {shard}: scanned {member_idx}/{len(members)} "
+                        f"members, records={len(records)}/{target}",
+                        flush=True,
+                    )
                 ext = os.path.splitext(member.name)[1].lower()
                 if ext not in (".webm", ".wav", ".mp3", ".flac", ".ogg", ".opus"):
                     continue
@@ -377,7 +391,7 @@ def load_swahili():
                 if rec:
                     records.append(rec)
                 if len(records) % 500 == 0 and len(records) > 0:
-                    print(f"Swahili: {len(records)}/{target}")
+                    print(f"Swahili: {len(records)}/{target}", flush=True)
 
     save_records(records, cache)
     return records
@@ -514,14 +528,16 @@ def load_anv_language(lang: str, shards):
 
 
 def load_all_records():
+    print("=== Data loading starts ===", flush=True)
     records = []
     records.extend(load_swahili())
     shards = list_anv_shards()
     for lang in ["som", "kik", "luo", "mas", "kln"]:
+        print(f"=== Loading ANV language: {lang} ===", flush=True)
         records.extend(load_anv_language(lang, shards))
-    print(f"Total records before split: {len(records)}")
-    print(pd.Series([r["lang"] for r in records]).value_counts().sort_index().to_string())
-    print(pd.Series([r["source"] for r in records]).value_counts().to_string())
+    print(f"Total records before split: {len(records)}", flush=True)
+    print(pd.Series([r["lang"] for r in records]).value_counts().sort_index().to_string(), flush=True)
+    print(pd.Series([r["source"] for r in records]).value_counts().to_string(), flush=True)
     return records
 
 
@@ -646,11 +662,13 @@ def load_model():
 
 
 def train_round6():
+    print("=== Round 6 training wrapper starts; loading cached/preprocessed records first ===", flush=True)
     records = load_all_records()
+    print("=== Data loading complete; building stratified split ===", flush=True)
     train_records, eval_records = stratified_split(records, eval_frac=0.05)
     train_ds = WhisperDataset(train_records)
     eval_ds = WhisperDataset(eval_records)
-    print(f"Train={len(train_ds)} Eval={len(eval_ds)}")
+    print(f"Train={len(train_ds)} Eval={len(eval_ds)}", flush=True)
 
     data_collator = DataCollator(
         processor=processor,
@@ -698,6 +716,7 @@ def train_round6():
         processing_class=feature_extractor,
     )
 
+    print("=== Actual GPU training starts now ===", flush=True)
     trainer.train()
     trainer.save_model(CHECKPOINT_DIR)
     processor.save_pretrained(CHECKPOINT_DIR)
