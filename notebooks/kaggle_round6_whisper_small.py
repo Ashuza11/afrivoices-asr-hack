@@ -115,13 +115,17 @@ MAX_LABEL_LEN = 448
 # on GPU time, set this to PREVIOUS_REPO_ID to adapt from Round 5 instead.
 START_FROM = MODEL_ID
 
+# Kaggle RAM is the bottleneck. Whisper features are large:
+# one 30s feature tensor is roughly 80 * 3000 * float16 ~= 0.48 MB,
+# before Python/list/label overhead. Keep the default run near the Round 5
+# scale and only expand further after a successful score.
 SCRIPTED_TARGETS = {
     "swa": 3000,
     "som": 3000,
     "kik": 5000,
     "luo": 3000,
-    "mas": 7000,
-    "kln": 6000,
+    "mas": 5000,
+    "kln": 5000,
 }
 
 UNSCRIPTED_TARGETS = {
@@ -134,10 +138,10 @@ UNSCRIPTED_TARGETS = {
 
 MAX_UNSCRIPTED_SHARDS = 30
 
-ENABLE_SPEED_PERTURBATION = True
+ENABLE_SPEED_PERTURBATION = False
 SPEED_PERTURB_LANGS = {"mas", "kln"}
 SPEED_FACTORS = [0.9, 1.1]
-MAX_AUGMENTED_PER_LANG = 3500
+MAX_AUGMENTED_PER_LANG = 1000
 
 MAX_STEPS = 4500
 LEARNING_RATE = 1e-5
@@ -148,8 +152,9 @@ PER_DEVICE_EVAL_BATCH = 8
 GEN_MAX_LENGTH = 64
 GEN_BEAMS = 3
 
-RUN_TRAINING = True
-RUN_INFERENCE = True
+RUN_PREPARE_DATA = True
+RUN_TRAINING = False
+RUN_INFERENCE = False
 PUSH_TO_HUB = True
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -661,9 +666,11 @@ def load_model():
     return model
 
 
-def train_round6():
-    print("=== Round 6 training wrapper starts; loading cached/preprocessed records first ===", flush=True)
-    records = load_all_records()
+def train_round6(records=None):
+    print("=== Round 6 training wrapper starts ===", flush=True)
+    if records is None:
+        print("No prepared records were passed; loading cached/preprocessed records first", flush=True)
+        records = load_all_records()
     print("=== Data loading complete; building stratified split ===", flush=True)
     train_records, eval_records = stratified_split(records, eval_frac=0.05)
     train_ds = WhisperDataset(train_records)
@@ -736,13 +743,34 @@ def train_round6():
     torch.cuda.empty_cache()
 
 
-if RUN_TRAINING:
-    train_round6()
+# %% [code]
+# ============================================================
+# 8. Prepare data only
+# ============================================================
+
+
+PREPARED_RECORDS = None
+
+if RUN_PREPARE_DATA:
+    PREPARED_RECORDS = load_all_records()
+    print(f"Prepared records in memory: {len(PREPARED_RECORDS)}", flush=True)
 
 
 # %% [code]
 # ============================================================
-# 8. Test duration probe
+# 9. Train only
+# ============================================================
+
+
+if RUN_TRAINING:
+    if PREPARED_RECORDS is None:
+        PREPARED_RECORDS = load_all_records()
+    train_round6(PREPARED_RECORDS)
+
+
+# %% [code]
+# ============================================================
+# 10. Test duration probe
 # ============================================================
 
 
