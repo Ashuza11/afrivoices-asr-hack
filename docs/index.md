@@ -102,6 +102,18 @@ Loading 11,000 audio clips as float32 spectrograms requires ~10.5 GB of RAM. Sto
 
 ## Results
 
+## Round 6 Colab Recovery Plan
+
+The Kaggle Round 6 notebook hit system-RAM limits before completing training.
+The current recovery plan runs two Colab Pro notebooks in parallel:
+
+- **Round 6A:** current low-RAM Whisper-small run.
+- **Round 6B:** same model family with stronger ANV Somali/Maxatire and
+  unscripted-speech sampling.
+
+See the [Round 6 Colab runbook](round6_colab_runs.md) for runtime settings,
+data targets, run order, and submission variant handling.
+
 ### WER Progression
 
 | Stage | Hardware | Steps | Train Loss | Leaderboard WER | Δ vs previous |

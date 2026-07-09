@@ -4,6 +4,7 @@ __pycache__/
 *.pyo
 *.egg-info/
 .env
+.env.*
 
 # Models and checkpoints (too large for git — use HuggingFace Hub)
 models/
@@ -25,6 +26,17 @@ data/*.tar.xz
 submission.csv
 submission_*.csv
 wandb/
+
+# Notebook/runtime noise
+.ipynb_checkpoints/
+lightning_logs/
+runs/
+
+# Agent and local assistant state
+.agents/
+.agent/
+.claude/
+.codex/
 
 # Internal planning doc
 PLAN.md

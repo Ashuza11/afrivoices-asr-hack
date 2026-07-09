@@ -157,6 +157,7 @@ RUN_PREPARE_DATA = True
 RUN_TRAINING = False
 RUN_INFERENCE = False
 PUSH_TO_HUB = True
+PREPARED_RECORDS = None
 
 if RUN_PREPARE_DATA and (RUN_TRAINING or RUN_INFERENCE):
     raise ValueError(
@@ -262,8 +263,7 @@ def memory_guard(context: str):
 def save_records(records, path):
     packed = [
         {
-            "audio_bytes": r.get("audio_bytes"),
-            "audio_array": r.get("audio_array"),
+            "input_features": r["input_features"].astype(np.float16, copy=False),
             "labels": r["labels"],
             "lang": r["lang"],
             "source": r["source"],
@@ -275,14 +275,169 @@ def save_records(records, path):
     print(f"Saved {len(records)} records -> {path} ({os.path.getsize(path)/1e6:.0f} MB)")
 
 
+def record_has_audio(record) -> bool:
+    return record.get("input_features") is not None or bool(record.get("audio_bytes")) or record.get("audio_array") is not None
+
+
+def make_feature_record(arr: np.ndarray, labels, lang: str, source: str):
+    input_features = feature_extractor(
+        arr[:MAX_AUDIO_SAMPLES],
+        sampling_rate=SAMPLE_RATE,
+    ).input_features[0].astype(np.float16, copy=False)
+    return {
+        "input_features": input_features,
+        "labels": labels,
+        "lang": lang,
+        "source": source,
+    }
+
+
+def ensure_input_feature_records(records, context: str):
+    """Modal-compatible records: precomputed input_features plus labels."""
+    total = len(records)
+    already_featured = sum(1 for record in records if record.get("input_features") is not None)
+    needs_conversion = total - already_featured
+    print(
+        f"{context}: preparing Modal-style records "
+        f"(total={total}, already_input_features={already_featured}, raw_to_convert={needs_conversion})",
+        flush=True,
+    )
+
+    converted = []
+    dropped = []
+    for i, record in enumerate(records):
+        if i and i % 500 == 0:
+            print(
+                f"{context}: prepared {i}/{total} records "
+                f"(kept={len(converted)}, dropped={len(dropped)})",
+                flush=True,
+            )
+
+        labels = record.get("labels")
+        if not labels:
+            dropped.append((i, record, "missing labels"))
+            continue
+
+        if record.get("input_features") is not None:
+            converted.append(
+                {
+                    "input_features": np.asarray(record["input_features"], dtype=np.float16),
+                    "labels": labels,
+                    "lang": record.get("lang", "unknown"),
+                    "source": record.get("source", "unknown"),
+                }
+            )
+            continue
+
+        try:
+            if record.get("audio_bytes"):
+                arr = decode_audio({"bytes": record["audio_bytes"]})
+            elif record.get("audio_array") is not None:
+                arr = np.asarray(record["audio_array"], dtype=np.float32)
+            else:
+                dropped.append((i, record, "missing audio"))
+                continue
+            converted.append(
+                make_feature_record(
+                    arr,
+                    labels,
+                    record.get("lang", "unknown"),
+                    record.get("source", "unknown"),
+                )
+            )
+        except Exception as e:
+            dropped.append((i, record, type(e).__name__))
+
+    if dropped:
+        print(
+            f"{context}: dropped {len(dropped)} records while preparing Modal-style input_features "
+            f"(kept {len(converted)}/{len(records)})",
+            flush=True,
+        )
+        sample = [
+            {
+                "idx": idx,
+                "lang": record.get("lang"),
+                "source": record.get("source"),
+                "reason": reason,
+            }
+            for idx, record, reason in dropped[:10]
+        ]
+        print(f"{context}: dropped sample={sample}", flush=True)
+        grouped = pd.Series(
+            [
+                (record.get("lang", "unknown"), record.get("source", "unknown"), reason)
+                for _, record, reason in dropped
+            ]
+        ).value_counts()
+        if not grouped.empty:
+            print(f"{context}: dropped by lang/source/reason:\n{grouped.to_string()}", flush=True)
+
+    if not converted:
+        raise ValueError(f"{context}: no usable records remain after input feature preparation")
+    print(
+        f"{context}: input feature preparation complete "
+        f"(kept={len(converted)}, dropped={len(dropped)})",
+        flush=True,
+    )
+    return converted
+
+
+def validate_records(records, context: str):
+    """Drop malformed cache rows before they reach the training collator."""
+    valid = []
+    bad = []
+    for i, record in enumerate(records):
+        has_labels = bool(record.get("labels"))
+        has_audio = record_has_audio(record)
+        if has_labels and has_audio:
+            valid.append(record)
+        else:
+            bad.append((i, record, has_audio, has_labels))
+
+    if bad:
+        print(
+            f"{context}: dropped {len(bad)} malformed records "
+            f"(kept {len(valid)}/{len(records)})",
+            flush=True,
+        )
+        sample = []
+        for idx, record, has_audio, has_labels in bad[:10]:
+            sample.append(
+                {
+                    "idx": idx,
+                    "lang": record.get("lang"),
+                    "source": record.get("source"),
+                    "has_audio": has_audio,
+                    "has_labels": has_labels,
+                }
+            )
+        print(f"{context}: malformed sample={sample}", flush=True)
+
+        grouped = pd.Series(
+            [
+                (record.get("lang", "unknown"), record.get("source", "unknown"))
+                for _, record, _, _ in bad
+            ]
+        ).value_counts()
+        if not grouped.empty:
+            print(f"{context}: malformed by lang/source:\n{grouped.to_string()}", flush=True)
+
+    if not valid:
+        raise ValueError(f"{context}: no valid records remain after validation")
+    return valid
+
+
 def load_records(path):
     with open(path, "rb") as f:
         records = pickle.load(f)
-    if records and "input_features" in records[0]:
-        raise RuntimeError(
-            f"{path} is an old feature-tensor cache. Delete it or use the raw_v3 cache path."
-        )
-    return records
+    return ensure_input_feature_records(validate_records(records, f"cache {os.path.basename(path)}"), f"cache {os.path.basename(path)}")
+
+
+# %% [markdown]
+# Training records follow the Modal script shape: precomputed Whisper
+# input_features plus labels. If an older raw-audio cache is loaded, it is
+# converted once before training and undecodable clips are skipped.
 
 
 # %% [code]
@@ -328,33 +483,21 @@ def make_record_from_bytes(audio_bytes: bytes, text: str, lang: str, source: str
     labels = build_labels(text, lang)
     if labels is None:
         return None
-    return {
-        "audio_bytes": audio_bytes,
-        "audio_array": None,
-        "labels": labels,
-        "lang": lang,
-        "source": source,
-    }
+    arr = decode_audio({"bytes": audio_bytes})
+    return make_feature_record(arr, labels, lang, source)
 
 
 def make_record_from_array(arr: np.ndarray, text: str, lang: str, source: str):
     labels = build_labels(text, lang)
     if labels is None:
         return None
-    return {
-        "audio_bytes": None,
-        "audio_array": arr[:MAX_AUDIO_SAMPLES].astype(np.float16, copy=False),
-        "labels": labels,
-        "lang": lang,
-        "source": source,
-    }
+    return make_feature_record(arr, labels, lang, source)
 
 
 def make_record(audio_field, text: str, lang: str, source: str):
-    raw = audio_field.get("bytes") if isinstance(audio_field, dict) else audio_field
-    if isinstance(raw, bytes) and raw:
-        return make_record_from_bytes(raw, text, lang, source)
     arr = decode_audio(audio_field)
+    if len(arr) > MAX_AUDIO_SAMPLES:
+        return None
     return make_record_from_array(arr, text, lang, source)
 
 
@@ -597,7 +740,7 @@ def load_all_records():
     print(f"Total records before split: {len(records)}", flush=True)
     print(pd.Series([r["lang"] for r in records]).value_counts().sort_index().to_string(), flush=True)
     print(pd.Series([r["source"] for r in records]).value_counts().to_string(), flush=True)
-    return records
+    return validate_records(records, "load_all_records")
 
 
 def prepare_data_caches():
@@ -668,20 +811,10 @@ class DataCollator:
     decoder_start_token_id: int
 
     def __call__(self, features: List[Dict[str, Any]]):
-        arrays = []
-        for f in features:
-            if f.get("audio_bytes"):
-                arr = decode_audio({"bytes": f["audio_bytes"]})
-            elif f.get("audio_array") is not None:
-                arr = np.asarray(f["audio_array"], dtype=np.float32)
-            else:
-                raise ValueError("Record has neither audio_bytes nor audio_array")
-            arrays.append(arr[:MAX_AUDIO_SAMPLES])
-        input_features = self.processor.feature_extractor(
-            arrays,
-            sampling_rate=SAMPLE_RATE,
-            return_tensors="pt",
-        ).input_features
+        input_features = torch.tensor(
+            np.stack([f["input_features"] for f in features]),
+            dtype=torch.float32,
+        )
         label_features = [{"input_ids": f["labels"]} for f in features]
         labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
         labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
@@ -764,6 +897,8 @@ def train_round6(records=None):
     if records is None:
         print("No prepared records were passed; loading cached/preprocessed records first", flush=True)
         records = load_all_records()
+    else:
+        records = ensure_input_feature_records(validate_records(records, "train_round6 input"), "train_round6 input")
     print("=== Data loading complete; building stratified split ===", flush=True)
     train_records, eval_records = stratified_split(records, eval_frac=0.05)
     train_ds = WhisperDataset(train_records)
@@ -841,8 +976,6 @@ def train_round6(records=None):
 # 8. Prepare data only
 # ============================================================
 
-
-PREPARED_RECORDS = None
 
 if RUN_PREPARE_DATA:
     prepare_data_caches()
