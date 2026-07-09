@@ -100,7 +100,7 @@ PREVIOUS_REPO_ID = "Ash11/afrivoices-whisper-small-all6"
 ROUND_REPO_NAME = "afrivoices-whisper-small-round6"
 
 WORK_DIR = "/kaggle/working"
-CACHE_DIR = f"{WORK_DIR}/records_round6_raw_v2"
+CACHE_DIR = f"{WORK_DIR}/records_round6_raw_v3"
 CHECKPOINT_DIR = f"{WORK_DIR}/whisper-small-round6"
 OUTPUT_DIR = f"{WORK_DIR}/outputs_round6"
 TEST_CACHE = f"{WORK_DIR}/test_parquets"
@@ -120,23 +120,23 @@ START_FROM = MODEL_ID
 # clip; keep compact audio bytes and compute features inside the collator.
 # This prevents the data-prep phase from filling system RAM before training.
 SCRIPTED_TARGETS = {
-    "swa": 2500,
-    "som": 2500,
-    "kik": 3000,
-    "luo": 2500,
-    "mas": 3000,
-    "kln": 3000,
+    "swa": 2000,
+    "som": 2000,
+    "kik": 2500,
+    "luo": 2000,
+    "mas": 2500,
+    "kln": 2500,
 }
 
 UNSCRIPTED_TARGETS = {
-    "som": 1000,
-    "kik": 1000,
-    "luo": 1000,
-    "mas": 1000,
-    "kln": 1000,
+    "som": 500,
+    "kik": 500,
+    "luo": 500,
+    "mas": 500,
+    "kln": 500,
 }
 
-MAX_UNSCRIPTED_SHARDS = 12
+MAX_UNSCRIPTED_SHARDS = 8
 MEMORY_STOP_GB = 24.0
 
 ENABLE_SPEED_PERTURBATION = False
@@ -157,6 +157,13 @@ RUN_PREPARE_DATA = True
 RUN_TRAINING = False
 RUN_INFERENCE = False
 PUSH_TO_HUB = True
+
+if RUN_PREPARE_DATA and (RUN_TRAINING or RUN_INFERENCE):
+    raise ValueError(
+        "Run data preparation separately first. Set RUN_PREPARE_DATA=True with "
+        "RUN_TRAINING=False and RUN_INFERENCE=False, then start a fresh session "
+        "with RUN_PREPARE_DATA=False and RUN_TRAINING=True."
+    )
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Device: {DEVICE}")
@@ -273,7 +280,7 @@ def load_records(path):
         records = pickle.load(f)
     if records and "input_features" in records[0]:
         raise RuntimeError(
-            f"{path} is an old feature-tensor cache. Delete it or use the raw_v2 cache path."
+            f"{path} is an old feature-tensor cache. Delete it or use the raw_v3 cache path."
         )
     return records
 
@@ -683,11 +690,15 @@ class DataCollator:
         return {"input_features": input_features, "labels": labels}
 
 
-wer_metric = evaluate.load("wer")
+wer_metric = None
 LANG_TOKEN_ID = {tokenizer.convert_tokens_to_ids(tok): lang for lang, tok in LANG_TOKEN.items()}
 
 
 def compute_metrics(pred):
+    global wer_metric
+    if wer_metric is None:
+        wer_metric = evaluate.load("wer")
+
     pred_ids = pred.predictions
     label_ids = pred.label_ids
     first_tok = label_ids[:, 0].copy()
