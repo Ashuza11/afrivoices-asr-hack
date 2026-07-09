@@ -54,6 +54,7 @@ import io
 import json
 import os
 import pickle
+import resource
 import random
 import re
 import shutil
@@ -99,7 +100,7 @@ PREVIOUS_REPO_ID = "Ash11/afrivoices-whisper-small-all6"
 ROUND_REPO_NAME = "afrivoices-whisper-small-round6"
 
 WORK_DIR = "/kaggle/working"
-CACHE_DIR = f"{WORK_DIR}/records_round6"
+CACHE_DIR = f"{WORK_DIR}/records_round6_raw_v2"
 CHECKPOINT_DIR = f"{WORK_DIR}/whisper-small-round6"
 OUTPUT_DIR = f"{WORK_DIR}/outputs_round6"
 TEST_CACHE = f"{WORK_DIR}/test_parquets"
@@ -115,40 +116,40 @@ MAX_LABEL_LEN = 448
 # on GPU time, set this to PREVIOUS_REPO_ID to adapt from Round 5 instead.
 START_FROM = MODEL_ID
 
-# Kaggle RAM is the bottleneck. Whisper features are large:
-# one 30s feature tensor is roughly 80 * 3000 * float16 ~= 0.48 MB,
-# before Python/list/label overhead. Keep the default run near the Round 5
-# scale and only expand further after a successful score.
+# Kaggle RAM is the bottleneck. Do not cache Whisper feature tensors for every
+# clip; keep compact audio bytes and compute features inside the collator.
+# This prevents the data-prep phase from filling system RAM before training.
 SCRIPTED_TARGETS = {
-    "swa": 3000,
-    "som": 3000,
-    "kik": 5000,
-    "luo": 3000,
-    "mas": 5000,
-    "kln": 5000,
+    "swa": 2500,
+    "som": 2500,
+    "kik": 3000,
+    "luo": 2500,
+    "mas": 3000,
+    "kln": 3000,
 }
 
 UNSCRIPTED_TARGETS = {
-    "som": 2500,
-    "kik": 2500,
-    "luo": 2500,
-    "mas": 2500,
-    "kln": 2500,
+    "som": 1000,
+    "kik": 1000,
+    "luo": 1000,
+    "mas": 1000,
+    "kln": 1000,
 }
 
-MAX_UNSCRIPTED_SHARDS = 30
+MAX_UNSCRIPTED_SHARDS = 12
+MEMORY_STOP_GB = 24.0
 
 ENABLE_SPEED_PERTURBATION = False
 SPEED_PERTURB_LANGS = {"mas", "kln"}
 SPEED_FACTORS = [0.9, 1.1]
 MAX_AUGMENTED_PER_LANG = 1000
 
-MAX_STEPS = 4500
+MAX_STEPS = 3000
 LEARNING_RATE = 1e-5
 WARMUP_STEPS = 500
 PER_DEVICE_TRAIN_BATCH = 16
 GRADIENT_ACCUMULATION = 2
-PER_DEVICE_EVAL_BATCH = 8
+PER_DEVICE_EVAL_BATCH = 4
 GEN_MAX_LENGTH = 64
 GEN_BEAMS = 3
 
@@ -237,10 +238,25 @@ def speed_perturb(arr: np.ndarray, factor: float) -> np.ndarray:
     return y.astype(np.float32, copy=False)
 
 
+def current_rss_gb() -> float:
+    rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return rss_kb / 1e6
+
+
+def memory_guard(context: str):
+    rss = current_rss_gb()
+    if rss >= MEMORY_STOP_GB:
+        raise MemoryError(
+            f"RAM guard tripped during {context}: max RSS {rss:.1f} GB >= {MEMORY_STOP_GB:.1f} GB. "
+            "Reduce targets or run training with the caches already prepared."
+        )
+
+
 def save_records(records, path):
     packed = [
         {
-            "input_features": r["input_features"].astype(np.float16, copy=False),
+            "audio_bytes": r.get("audio_bytes"),
+            "audio_array": r.get("audio_array"),
             "labels": r["labels"],
             "lang": r["lang"],
             "source": r["source"],
@@ -254,7 +270,12 @@ def save_records(records, path):
 
 def load_records(path):
     with open(path, "rb") as f:
-        return pickle.load(f)
+        records = pickle.load(f)
+    if records and "input_features" in records[0]:
+        raise RuntimeError(
+            f"{path} is an old feature-tensor cache. Delete it or use the raw_v2 cache path."
+        )
+    return records
 
 
 # %% [code]
@@ -296,17 +317,38 @@ def build_labels(text: str, lang3: str):
     return labels
 
 
-def make_record(arr: np.ndarray, text: str, lang: str, source: str):
+def make_record_from_bytes(audio_bytes: bytes, text: str, lang: str, source: str):
     labels = build_labels(text, lang)
     if labels is None:
         return None
-    feats = feature_extractor(arr[:MAX_AUDIO_SAMPLES], sampling_rate=16000).input_features[0]
     return {
-        "input_features": feats.astype(np.float16),
+        "audio_bytes": audio_bytes,
+        "audio_array": None,
         "labels": labels,
         "lang": lang,
         "source": source,
     }
+
+
+def make_record_from_array(arr: np.ndarray, text: str, lang: str, source: str):
+    labels = build_labels(text, lang)
+    if labels is None:
+        return None
+    return {
+        "audio_bytes": None,
+        "audio_array": arr[:MAX_AUDIO_SAMPLES].astype(np.float16, copy=False),
+        "labels": labels,
+        "lang": lang,
+        "source": source,
+    }
+
+
+def make_record(audio_field, text: str, lang: str, source: str):
+    raw = audio_field.get("bytes") if isinstance(audio_field, dict) else audio_field
+    if isinstance(raw, bytes) and raw:
+        return make_record_from_bytes(raw, text, lang, source)
+    arr = decode_audio(audio_field)
+    return make_record_from_array(arr, text, lang, source)
 
 
 print(f"Tokenizer size: {len(tokenizer)}")
@@ -389,14 +431,15 @@ def load_swahili():
                 if base not in wanted:
                     continue
                 try:
-                    arr = decode_audio({"bytes": tar.extractfile(member).read()})
-                    rec = make_record(arr, wanted[base], "swa", "scripted")
+                    raw = tar.extractfile(member).read()
+                    rec = make_record_from_bytes(raw, wanted[base], "swa", "scripted")
                 except Exception:
                     rec = None
                 if rec:
                     records.append(rec)
                 if len(records) % 500 == 0 and len(records) > 0:
                     print(f"Swahili: {len(records)}/{target}", flush=True)
+                    memory_guard("Swahili harvest")
 
     save_records(records, cache)
     return records
@@ -474,11 +517,7 @@ def harvest_anv(lang: str, subtype: str, target: int, shard_list: List[str], max
                     skipped_long += 1
                     continue
                 try:
-                    arr = decode_audio(row["audio"])
-                    if len(arr) > MAX_AUDIO_SAMPLES:
-                        skipped_long += 1
-                        continue
-                    rec = make_record(arr, text, lang, subtype)
+                    rec = make_record(row["audio"], text, lang, subtype)
                 except Exception:
                     rec = None
                 if rec:
@@ -493,8 +532,9 @@ def harvest_anv(lang: str, subtype: str, target: int, shard_list: List[str], max
                             if made_by_factor[factor] >= per_factor_limit:
                                 continue
                             try:
+                                arr = decode_audio(row["audio"])
                                 aug_arr = speed_perturb(arr, factor)
-                                aug_rec = make_record(aug_arr, text, lang, f"scripted_speed_{factor}")
+                                aug_rec = make_record_from_array(aug_arr, text, lang, f"scripted_speed_{factor}")
                             except Exception:
                                 aug_rec = None
                             if aug_rec:
@@ -508,6 +548,9 @@ def harvest_anv(lang: str, subtype: str, target: int, shard_list: List[str], max
         if max_augmented:
             msg += f" augmented={len(augmented)}/{max_augmented}"
         print(msg)
+        del df
+        gc.collect()
+        memory_guard(f"{lang}/{subtype} harvest")
     return records + augmented
 
 
@@ -536,14 +579,42 @@ def load_all_records():
     print("=== Data loading starts ===", flush=True)
     records = []
     records.extend(load_swahili())
+    print(f"After Swahili: records={len(records)} max_rss={current_rss_gb():.1f} GB", flush=True)
+    memory_guard("load_all_records/Swahili")
     shards = list_anv_shards()
     for lang in ["som", "kik", "luo", "mas", "kln"]:
         print(f"=== Loading ANV language: {lang} ===", flush=True)
         records.extend(load_anv_language(lang, shards))
+        print(f"After {lang}: records={len(records)} max_rss={current_rss_gb():.1f} GB", flush=True)
+        memory_guard(f"load_all_records/{lang}")
     print(f"Total records before split: {len(records)}", flush=True)
     print(pd.Series([r["lang"] for r in records]).value_counts().sort_index().to_string(), flush=True)
     print(pd.Series([r["source"] for r in records]).value_counts().to_string(), flush=True)
     return records
+
+
+def prepare_data_caches():
+    """Create per-language record caches without retaining all languages in RAM."""
+    print("=== Data cache preparation starts ===", flush=True)
+
+    recs = load_swahili()
+    print(f"Cached Swahili records: {len(recs)}", flush=True)
+    del recs
+    gc.collect()
+    print(f"RAM after Swahili cache: max_rss={current_rss_gb():.1f} GB", flush=True)
+    memory_guard("prepare_data_caches/Swahili")
+
+    shards = list_anv_shards()
+    for lang in ["som", "kik", "luo", "mas", "kln"]:
+        print(f"=== Preparing ANV cache for: {lang} ===", flush=True)
+        recs = load_anv_language(lang, shards)
+        print(f"Cached {lang} records: {len(recs)}", flush=True)
+        del recs
+        gc.collect()
+        print(f"RAM after {lang} cache: max_rss={current_rss_gb():.1f} GB", flush=True)
+        memory_guard(f"prepare_data_caches/{lang}")
+
+    print("=== Data cache preparation complete ===", flush=True)
 
 
 # %% [code]
@@ -590,9 +661,20 @@ class DataCollator:
     decoder_start_token_id: int
 
     def __call__(self, features: List[Dict[str, Any]]):
-        input_features = torch.tensor(
-            np.stack([f["input_features"] for f in features]), dtype=torch.float32
-        )
+        arrays = []
+        for f in features:
+            if f.get("audio_bytes"):
+                arr = decode_audio({"bytes": f["audio_bytes"]})
+            elif f.get("audio_array") is not None:
+                arr = np.asarray(f["audio_array"], dtype=np.float32)
+            else:
+                raise ValueError("Record has neither audio_bytes nor audio_array")
+            arrays.append(arr[:MAX_AUDIO_SAMPLES])
+        input_features = self.processor.feature_extractor(
+            arrays,
+            sampling_rate=SAMPLE_RATE,
+            return_tensors="pt",
+        ).input_features
         label_features = [{"input_ids": f["labels"]} for f in features]
         labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
         labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
@@ -701,8 +783,8 @@ def train_round6(records=None):
         predict_with_generate=True,
         generation_max_length=GEN_MAX_LENGTH,
         generation_num_beams=GEN_BEAMS,
-        save_steps=750,
-        eval_steps=750,
+        save_steps=1000,
+        eval_steps=1000,
         save_total_limit=3,
         logging_steps=50,
         load_best_model_at_end=True,
@@ -752,8 +834,7 @@ def train_round6(records=None):
 PREPARED_RECORDS = None
 
 if RUN_PREPARE_DATA:
-    PREPARED_RECORDS = load_all_records()
-    print(f"Prepared records in memory: {len(PREPARED_RECORDS)}", flush=True)
+    prepare_data_caches()
 
 
 # %% [code]
