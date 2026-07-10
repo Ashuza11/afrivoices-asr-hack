@@ -71,12 +71,16 @@ Default targets:
 For each notebook:
 
 1. Set Colab secrets: `HF_TOKEN` and `KAGGLE_KEY` or `KAGGLE_API_TOKEN`.
-2. Run once with `RUN_PREPARE_DATA=True`, `RUN_TRAINING=False`,
+2. Run Cell 1 to mount Drive and install dependencies. If this is the first
+   Cell 1 run in the current runtime, restart the runtime before continuing.
+   Colab Python 3.12 can otherwise keep an incompatible preinstalled NumPy
+   extension loaded and fail later at `import evaluate`.
+3. Run once with `RUN_PREPARE_DATA=True`, `RUN_TRAINING=False`,
    `RUN_INFERENCE=False`.
-3. Restart the runtime.
-4. Set `RUN_PREPARE_DATA=False`, `RUN_TRAINING=True`,
+4. Restart the runtime after data preparation completes.
+5. Set `RUN_PREPARE_DATA=False`, `RUN_TRAINING=True`,
    `RUN_INFERENCE=False`.
-5. After training, set `RUN_TRAINING=False`, `RUN_INFERENCE=True`.
+6. After training, set `RUN_TRAINING=False`, `RUN_INFERENCE=True`.
 
 Both notebooks write submission variants:
 
