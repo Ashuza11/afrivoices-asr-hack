@@ -269,6 +269,64 @@ Therefore every inference run must save multiple submission variants:
 The leaderboard decides which variant is better. Do not hard-code a single
 normalization assumption before seeing submission scores.
 
+## Round 6D: Segmented Long-Unscripted Run
+
+Notebook: `notebooks/colab_round6d_segmented_unscripted_whisper_small.ipynb`
+
+The spread-shard duration audit was added to `data/`:
+
+- `data/round6c_duration_audit_spread.csv`
+- `data/round6c_duration_audit_spread_summary.csv`
+
+The audit confirms that long unscripted clips are a major bottleneck:
+
+| Language | Unscripted >30s | Unscripted p90 sec | Mean sec |
+|---|---:|---:|---:|
+| som | 92.75% | 90.24 | 77.08 |
+| kik | 85.57% | 79.26 | 59.73 |
+| kln | 81.03% | 83.97 | 65.07 |
+| luo | 74.11% | 87.41 | 53.77 |
+| mas | 62.98% | 75.90 | 49.65 |
+
+Scripted clips are mostly short, so the segmentation fix is targeted only at
+unscripted clips. Round 6D segments long unscripted clips instead of skipping
+them:
+
+- segment length: 25 seconds
+- maximum source duration for proportional segmentation: 180 seconds
+- maximum segments per source clip: 8
+- minimum segment duration: 4 seconds
+- minimum transcript words per segment: 3
+- transcript splitting: proportional by word count
+
+This is intentionally conservative. It does not claim timestamp-level alignment.
+It converts a previously discarded long clip into several approximate training
+pairs only when the transcript has enough words to support the number of audio
+segments. The goal is to recover spontaneous-domain signal without flooding the
+model with obviously empty or tiny text chunks.
+
+Round 6D targets:
+
+| Type | swa | som | kik | luo | mas | kln |
+|---|---:|---:|---:|---:|---:|---:|
+| Scripted | 1200 | 2500 | 3000 | 2500 | 6000 | 6000 |
+| Short unscripted | - | 1500 | 1200 | 1000 | 3500 | 3500 |
+| Segmented bonus | - | 1200 | 1200 | 1000 | 2500 | 2500 |
+
+Estimated training size is about 42,700 rows after scripted speed perturbation
+for mas/kln. With batch size 32 and a 4% eval split, one epoch is about 1,281
+optimizer steps. The notebook uses `MAX_STEPS=3000`, or about 2.34 epochs.
+This is intentional: Round 6A improved until step 3000 and then degraded by WER
+even though eval loss continued to fall. Round 6D should be stopped by WER, not
+by loss. If macro WER or kln/mas WER degrades for two consecutive evals after
+the best checkpoint, stop the run.
+
+Expected impact is not enough by itself to reach 0.31. A realistic target for a
+successful Whisper-only segmented run is a 0.08-0.18 macro WER improvement if
+the proportional chunks are usable. If the run does not materially improve kln
+and mas, the next major lever must be a CTC/MMS or W2v-BERT track for those
+languages.
+
 ## Storage Plan
 
 The free Google Drive quota is too small for repeated FLAC caches and checkpoint
