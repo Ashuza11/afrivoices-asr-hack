@@ -1,0 +1,49 @@
+cluster:
+  name: FILL_ME
+  scheduler: FILL_ME
+
+scheduler:
+  account: FILL_ME
+  partition: FILL_ME
+  qos: null
+  reservation: null
+  maximum_walltime: FILL_ME
+  supports_job_arrays: FILL_ME
+  maximum_array_jobs: FILL_ME
+
+resources:
+  gpu_type: FILL_ME
+  gpu_count: FILL_ME
+  gpu_memory_gb: FILL_ME
+  cpu_cores: FILL_ME
+  system_memory_gb: FILL_ME
+
+storage:
+  scratch_directory: FILL_ME
+  persistent_directory: FILL_ME
+  scratch_quota_gb: FILL_ME
+  persistent_quota_gb: FILL_ME
+
+environment:
+  python_version: FILL_ME
+  cuda_version: FILL_ME
+  environment_system: FILL_ME
+  module_commands: []
+  container_image: null
+
+network:
+  compute_nodes_have_internet: FILL_ME
+  huggingface_access: FILL_ME
+  kaggle_access: FILL_ME
+
+execution:
+  submit_command: FILL_ME
+  status_command: FILL_ME
+  cancel_command: FILL_ME
+  repository_directory: FILL_ME
+  data_directory: FILL_ME
+  results_directory: FILL_ME
+
+edge_validation:
+  raspberry_pi_available: FILL_ME
+  alternative_cpu: null

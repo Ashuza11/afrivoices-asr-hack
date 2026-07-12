@@ -1,0 +1,71 @@
+project:
+  seed: 20260712
+  languages: [swa, som, kik, luo, mas, kln]
+
+paths:
+  # The canonical input may be JSONL or CSV. Raw dataset harvesting is the next
+  # implementation stage; keeping this boundary explicit makes split tests safe.
+  source_manifest: data/round7/source_manifest.jsonl
+  audio_root: .
+  output_dir: outputs/round7
+  persistent_dir: outputs/round7
+  scratch_dir: /tmp/afrivoices_round7
+
+sources:
+  swahili:
+    repo_id: DigitalUmuganda/Afrivoice_Swahili
+    manifest_pattern: agriculture_swahili_train/manifest_{shard}.jsonl
+    audio_pattern: agriculture_swahili_train/audio/audio_{shard}.tar.xz
+    shard_count: 2
+  anv:
+    repo_id: MCAA1-MSU/anv_data_ke
+    languages: [som, kik, luo, mas, kln]
+    split: train
+    subtypes: [scripted, unscripted]
+    # Pilot-first: choose evenly spread shards, not only the first shards.
+    maximum_shards_per_bucket: 6
+  policy:
+    digital_umuganda_languages: [swa]
+    anv_languages: [som, kik, luo, mas, kln]
+    allow_digital_umuganda_somali: false
+
+data:
+  validation_fraction: 0.05
+  minimum_duration_seconds: 0.25
+  maximum_source_duration_seconds: 600.0
+  seed_max_duration: 25.0
+  normalization: lower_strip_punctuation
+  verify_audio_files: true
+
+runtime:
+  require_cuda: true
+  minimum_free_disk_gb: 100
+  minimum_gpu_memory_gb: 20
+
+model:
+  id: facebook/wav2vec2-xls-r-300m
+  sample_rate: 16000
+  maximum_segment_seconds: 28
+
+alignment:
+  pilot_hours:
+    kln: 20
+    mas: 20
+    kik: 10
+    som: 10
+    luo: 10
+    swa: 10
+  minimum_coverage: 0.90
+  minimum_speech_occupancy: 0.70
+
+training:
+  encoder_learning_rate: 0.00002
+  head_learning_rate: 0.0001
+  warmup_ratio: 0.05
+  early_stopping_patience: 4
+  bf16: true
+  smoke_steps: 100
+  smoke_eval_samples_per_language: 50
+  per_device_batch_size: 4
+  gradient_accumulation_steps: 2
+  maximum_gradient_norm: 1.0

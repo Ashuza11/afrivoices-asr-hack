@@ -5,6 +5,12 @@ __pycache__/
 *.egg-info/
 .env
 .env.*
+!.env.example
+
+# Round 7 generated artifacts and local cluster configuration
+outputs/
+round7/cluster.yaml
+data/round7/
 
 # Models and checkpoints (too large for git — use HuggingFace Hub)
 models/
