@@ -351,8 +351,17 @@ def combine_manifests(manifest_root: Path, output_path: Path) -> dict[str, Any]:
 
 def prepare_sources(config: dict[str, Any]) -> dict[str, Any]:
     validate_source_policy(config)
-    if shutil.which("ffmpeg") is None:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        try:
+            import imageio_ffmpeg
+
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        except ImportError as exc:
+            raise RuntimeError("system ffmpeg or imageio-ffmpeg is required") from exc
+    if not ffmpeg or not Path(ffmpeg).is_file():
         raise RuntimeError("ffmpeg is required to decode Digital Umuganda archive audio")
+    AudioSegment.converter = ffmpeg
     token = os.environ.get("HF_TOKEN")
     sample_rate = int(config["model"]["sample_rate"])
     scratch = Path(config["paths"]["scratch_dir"])

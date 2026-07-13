@@ -7,8 +7,9 @@ cd "$REPO_ROOT"
 CONFIG="${ROUND7_CONFIG:-round7/config.yaml}"
 CLUSTER_CONFIG="${ROUND7_CLUSTER_CONFIG:-}"
 PYTHON="${ROUND7_PYTHON:-python3}"
+STAGE="${ROUND7_STAGE:-all}"
 
-args=(--config "$CONFIG" --stage all)
+args=(--config "$CONFIG" --stage "$STAGE")
 if [[ -n "$CLUSTER_CONFIG" ]]; then
   args+=(--cluster-config "$CLUSTER_CONFIG")
 fi

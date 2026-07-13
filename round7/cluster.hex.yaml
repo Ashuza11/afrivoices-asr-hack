@@ -1,0 +1,50 @@
+cluster:
+  name: UCREL Hex
+  scheduler: slurm
+
+scheduler:
+  account: null
+  partition: a5000-48h
+  qos: null
+  reservation: null
+  maximum_walltime: "48:00:00"
+  supports_job_arrays: true
+  maximum_array_jobs: 5
+
+resources:
+  gpu_type: NVIDIA RTX A5000
+  gpu_count: 1
+  gpu_memory_gb: 24
+  cpu_cores: 16
+  system_memory_gb: 32
+
+storage:
+  scratch_directory: null
+  # Replace the repository portion if Ignatius clones it under another name.
+  persistent_directory: "${HOME}/AfriVoices_ASR_Hack/outputs"
+  scratch_quota_gb: null
+  persistent_quota_gb: 512
+
+environment:
+  python_version: "3.12.3"
+  cuda_version: "13.2"
+  environment_system: venv
+  module_commands: []
+  container_image: null
+
+network:
+  compute_nodes_have_internet: true
+  huggingface_access: true
+  kaggle_access: true
+
+execution:
+  submit_command: sbatch
+  status_command: squeue
+  cancel_command: scancel
+  repository_directory: "${HOME}/AfriVoices_ASR_Hack"
+  data_directory: "${HOME}/AfriVoices_ASR_Hack/data"
+  results_directory: "${HOME}/AfriVoices_ASR_Hack/outputs/round7"
+
+edge_validation:
+  raspberry_pi_available: false
+  alternative_cpu: UCREL Hex CPU worker with feature passthrough

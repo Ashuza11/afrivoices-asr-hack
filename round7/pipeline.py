@@ -24,7 +24,26 @@ from round7.data import (
 )
 
 
-IMPLEMENTED_STAGES = ("prepare-sources", "preflight", "build-splits", "seed-smoke")
+IMPLEMENTED_STAGES = (
+    "preflight",
+    "prepare-sources",
+    "build-splits",
+    "seed-smoke",
+    "train-seed",
+    "align-pilot",
+)
+
+
+def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if key == "extends":
+            continue
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def load_yaml(path: Path) -> dict[str, Any]:
@@ -32,6 +51,12 @@ def load_yaml(path: Path) -> dict[str, Any]:
         value = yaml.safe_load(handle)
     if not isinstance(value, dict):
         raise ValueError(f"configuration must be a mapping: {path}")
+    parent = value.get("extends")
+    if parent:
+        parent_path = Path(parent)
+        if not parent_path.is_absolute():
+            parent_path = path.parent / parent_path
+        return deep_merge(load_yaml(parent_path.resolve()), value)
     return value
 
 
@@ -98,8 +123,6 @@ def preflight(config: dict[str, Any], cluster_config: dict[str, Any] | None) -> 
         raise ValueError("cluster configuration has unresolved fields: " + ", ".join(unresolved))
 
     source_manifest = Path(config["paths"]["source_manifest"])
-    if not source_manifest.is_file():
-        raise FileNotFoundError(f"source manifest not found: {source_manifest}")
 
     scratch = Path(config["paths"]["scratch_dir"])
     output = Path(config["paths"]["output_dir"])
@@ -133,6 +156,7 @@ def preflight(config: dict[str, Any], cluster_config: dict[str, Any] | None) -> 
         "platform": platform.platform(),
         "free_scratch_gb": round(free_disk, 2),
         "source_manifest": str(source_manifest),
+        "source_manifest_exists": source_manifest.is_file(),
         "torch": torch_details,
     }
     mark_complete(config, "preflight", details)
@@ -188,12 +212,55 @@ def seed_smoke(config: dict[str, Any]) -> None:
     print(json.dumps(metrics, indent=2))
 
 
+def train_seed(config: dict[str, Any]) -> None:
+    from round7.training import train_seed_model
+
+    split_directory = stage_directory(config, "build-splits")
+    smoke_directory = stage_directory(config, "seed-smoke")
+    if not (smoke_directory / "status.json").is_file():
+        raise RuntimeError("seed-smoke must complete before train-seed")
+    directory = stage_directory(config, "train-seed")
+    result = train_seed_model(config, split_directory, smoke_directory, directory)
+    atomic_write_json(directory / "result.json", result)
+    mark_complete(config, "train-seed", result)
+    print(json.dumps(result, indent=2))
+
+
+def align_pilot(config: dict[str, Any]) -> None:
+    from round7.alignment import run_alignment_pilot
+
+    seed_directory = stage_directory(config, "train-seed")
+    if not (seed_directory / "status.json").is_file():
+        raise RuntimeError("train-seed must complete before align-pilot")
+    directory = stage_directory(config, "align-pilot")
+    result = run_alignment_pilot(
+        config, stage_directory(config, "build-splits"), seed_directory, directory
+    )
+    atomic_write_json(directory / "report.json", result)
+    mark_complete(config, "align-pilot", result)
+    print(json.dumps(result, indent=2))
+
+
 def is_complete(config: dict[str, Any], stage: str) -> bool:
+    if stage == "preflight":
+        return False
     status = stage_directory(config, stage) / "status.json"
     if not status.is_file():
         return False
     try:
-        return json.loads(status.read_text(encoding="utf-8")).get("status") == "complete"
+        complete = json.loads(status.read_text(encoding="utf-8")).get("status") == "complete"
+        if not complete:
+            return False
+        if stage in {"prepare-sources", "build-splits", "align-pilot"}:
+            from round7.sources import manifest_audio_complete
+
+            manifests = {
+                "prepare-sources": Path(config["paths"]["source_manifest"]),
+                "build-splits": stage_directory(config, "build-splits") / "manifest.jsonl",
+                "align-pilot": stage_directory(config, "align-pilot") / "accepted.jsonl",
+            }
+            return manifest_audio_complete(manifests[stage])
+        return True
     except (OSError, json.JSONDecodeError):
         return False
 
@@ -212,6 +279,10 @@ def run_stage(
         build_splits(config)
     elif stage == "seed-smoke":
         seed_smoke(config)
+    elif stage == "train-seed":
+        train_seed(config)
+    elif stage == "align-pilot":
+        align_pilot(config)
     else:
         raise ValueError(f"stage is not implemented: {stage}")
 

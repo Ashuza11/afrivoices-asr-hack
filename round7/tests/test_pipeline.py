@@ -17,7 +17,7 @@ from round7.data import (
     normalize_text,
     verify_audio_records,
 )
-from round7.pipeline import unresolved_fields
+from round7.pipeline import load_yaml, unresolved_fields
 
 
 class NormalizationTests(unittest.TestCase):
@@ -154,6 +154,16 @@ class ClusterConfigTests(unittest.TestCase):
             unresolved_fields({"scheduler": {"partition": "FILL_ME", "qos": None}}),
             ["scheduler.partition"],
         )
+
+    def test_hex_profile_inherits_safe_a5000_settings(self):
+        config = load_yaml(Path("round7/config.hex.yaml"))
+        self.assertEqual(config["training"]["per_device_batch_size"], 1)
+        self.assertEqual(config["training"]["gradient_accumulation_steps"], 8)
+        self.assertEqual(config["paths"]["scratch_dir"], "outputs/round7/work")
+        cluster = load_yaml(Path("round7/cluster.hex.yaml"))
+        self.assertFalse(unresolved_fields(cluster))
+        self.assertEqual(cluster["scheduler"]["partition"], "a5000-48h")
+        self.assertEqual(cluster["resources"]["gpu_count"], 1)
 
 
 if __name__ == "__main__":

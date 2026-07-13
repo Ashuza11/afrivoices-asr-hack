@@ -57,6 +57,12 @@ alignment:
     swa: 10
   minimum_coverage: 0.90
   minimum_speech_occupancy: 0.70
+  minimum_mean_token_posterior: 0.20
+  minimum_segment_seconds: 2.0
+  maximum_segment_seconds: 25.0
+  maximum_source_seconds: 180.0
+  emission_chunk_seconds: 20.0
+  boundary_padding_seconds: 0.15
 
 training:
   encoder_learning_rate: 0.00002
@@ -69,3 +75,8 @@ training:
   per_device_batch_size: 4
   gradient_accumulation_steps: 2
   maximum_gradient_norm: 1.0
+  gradient_checkpointing: true
+  seed_max_steps: 3000
+  seed_eval_steps: 250
+  feature_encoder_freeze_ratio: 0.10
+  dataloader_workers: 4

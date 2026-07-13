@@ -1,0 +1,24 @@
+extends: config.yaml
+
+paths:
+  # Hex has no separate scratch filesystem. Keep restartable work in the
+  # repository/home filesystem, which is shared by all workers and NVMe cached.
+  source_manifest: data/round7/source_manifest.jsonl
+  audio_root: .
+  output_dir: outputs/round7
+  persistent_dir: outputs/round7
+  scratch_dir: outputs/round7/work
+
+runtime:
+  require_cuda: true
+  minimum_free_disk_gb: 100
+  minimum_gpu_memory_gb: 20
+
+training:
+  # One A5000 has 24 GiB. Batch one is the conservative setting for 25-second
+  # XLS-R 300M audio; accumulation preserves a useful effective batch.
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 8
+  dataloader_workers: 4
+  bf16: true
+  gradient_checkpointing: true

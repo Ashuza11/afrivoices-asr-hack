@@ -103,11 +103,11 @@ Fine-tune XLS-R 300M CTC first on trustworthy examples:
   rate pass sanity checks;
 - no proportional transcript slices from Round 6D.
 
-Use a shared character vocabulary plus explicit language identity. The safest
-implementation is one shared encoder with six small CTC output heads selected
-from the known language field. This remains a single packaged network and stays
-well below 1B parameters, but the organizers should confirm that language heads
-meet their interpretation of "single unified model."
+Use a shared character vocabulary plus explicit language identity. The
+implemented architecture is one shared encoder, one learned language embedding,
+and one shared CTC output head. This avoids ambiguity around whether six output
+heads count as separate language models while still conditioning the acoustic
+representation on the known language field.
 
 ### 4. Forced-align long recordings
 
@@ -197,27 +197,36 @@ an ablation and possible teacher for confidence filtering.
 The run should be delivered as one resumable pipeline so the person operating
 the cluster does not have to edit notebooks:
 
-1. `preflight`: print GPU, CUDA, storage, dataset checksums, row/hour counts, and
-   run 100 training steps plus one alignment sample per language.
-2. `build_splits`: create immutable grouped split manifests and leakage report.
-3. `train_seed_ctc`: train the clean short-audio alignment seed.
-4. `align_long_audio`: shard by language/source, resume per shard, and write
+1. `preflight`: print GPU, CUDA, storage, and environment checks.
+2. `prepare-sources`: download the source pilot with resumable per-shard output.
+3. `build-splits`: create immutable grouped split manifests and leakage report.
+4. `seed-smoke`: run 100 microbatches and verify checkpoint reload.
+5. `train-seed`: train the clean short-audio alignment seed.
+6. `align-pilot`: align the pilot by language/source, resume per recording, and
+   write accepted/rejected manifests.
+7. `alignment-gate`: audit samples and compare clean-only with clean-plus-aligned
+   training under the same validation split.
+8. `align-long-audio`: shard by language/source, resume per shard, and write
    accepted/rejected manifests.
-5. `audit_alignment`: produce accepted hours, confidence distributions, and 20
+9. `audit-alignment`: produce accepted hours, confidence distributions, and 20
    random audio/text examples per language for inspection. Inspection changes
    thresholds only; it must not manually transcribe data.
-6. `train_full_ctc`: distributed training with checkpoint and log upload after
+10. `train-full-ctc`: training with checkpoint and log upload after
    every evaluation.
-7. `decode_dev`: greedy, beam, and LM decoding with overall and per-language WER.
-8. `export_edge`: ONNX int8 export and numerical comparison against PyTorch.
-9. `benchmark_edge`: peak RSS and RTF by language and duration bucket on the
+11. `decode-dev`: greedy, beam, and LM decoding with overall and per-language WER.
+12. `export-edge`: ONNX int8 export and numerical comparison against PyTorch.
+13. `benchmark-edge`: peak RSS and RTF by language and duration bucket on the
    actual Raspberry Pi 4 or accepted equivalent.
-10. `infer_test`: run only after validation and edge gates pass; write resumable
+14. `infer-test`: run only after validation and edge gates pass; write resumable
     raw and normalized submissions.
 
-All stages must be restartable. Store manifests, selected checkpoints, metrics,
-and logs on persistent cluster storage; keep extracted audio and feature caches
-in scratch. Never place credentials in the job script or logs.
+The repository currently implements stages 1-6 only. Stages 7-14 are the
+remaining competition pipeline and must not be represented as executable yet.
+
+All stages must be restartable. Hex has no separate scratch filesystem, so
+manifests, extracted audio, checkpoints, metrics, and logs are kept under the
+shared home directory. The workers' aggressive read cache accelerates repeated
+reads after the first pass. Never place credentials in the job script or logs.
 
 ### Deadline schedule
 
@@ -259,20 +268,21 @@ For a realistic attempt at 0.31, the internal development result should be near
 that range before test inference. A development WER of 0.55 is useful research
 progress but is not evidence that leaderboard WER will be 0.31.
 
-## Information Needed From The Cluster Operator
+## UCREL Hex Configuration
 
-Ask for these details before generating the final scheduler script:
+The supplied Hex profile uses Slurm partition `a5000-48h`, one RTX A5000 with
+24 GiB VRAM, 16 CPU cores, 32 GiB RAM, and a 48-hour limit. The trainer is
+single-GPU, so reserving a three-GPU A5000 worker would not accelerate it and
+would not automatically combine the cards' memory. Batch size 1, accumulation
+8, BF16, and gradient checkpointing are set for the 24 GiB card.
 
-- scheduler (`Slurm`, `PBS`, or another system) and example job header;
-- GPU model, number of GPUs per node, and available GPU-hours;
-- system RAM, scratch quota, persistent quota, and job time limit;
-- internet access from compute nodes or the required model/data staging method;
-- container support (`Apptainer`/`Singularity`, Docker, or Conda);
-- whether a Raspberry Pi 4 is available for final validation.
-
-The minimum useful allocation is one modern 40-80 GB GPU for the seed and four
-GPUs for the full run. More GPUs reduce wall time but do not repair bad labels;
-alignment is the first dependency.
+Python 3.12.3 and a repository-local venv are used. Compute-node access to
+Hugging Face and Kaggle is available. The default shared-home quota is 512 GiB;
+there is no independent scratch path. Job arrays are limited to five unless the
+operator raises the limit. A dedicated `a5000-5m` preflight should pass before
+the 48-hour job is submitted. The actual 100-step model smoke test remains the
+first empirical memory check; static configuration cannot prove that a full
+25-second batch fits.
 
 ## Evidence Base
 
