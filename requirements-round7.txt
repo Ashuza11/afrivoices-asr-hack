@@ -12,3 +12,4 @@ pyarrow==18.1.0
 huggingface-hub==0.26.2
 pydub==0.25.1
 imageio-ffmpeg==0.5.1
+kagglehub==0.3.4

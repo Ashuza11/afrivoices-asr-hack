@@ -22,3 +22,6 @@ training:
   dataloader_workers: 4
   bf16: true
   gradient_checkpointing: true
+
+inference:
+  batch_size: 4

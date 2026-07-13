@@ -36,6 +36,8 @@ class LanguageConditionedXLSRForCTC(Wav2Vec2PreTrainedModel):
         base = Wav2Vec2Model.from_pretrained(model_id, **from_pretrained_kwargs)
         config = base.config
         config.vocab_size = vocab_size
+        config.pad_token_id = 0
+        config.ctc_zero_infinity = True
         config.language_codes = list(LANGUAGES)
         model = cls(config)
         model.wav2vec2.load_state_dict(base.state_dict(), strict=True)

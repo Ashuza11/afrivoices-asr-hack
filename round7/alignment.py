@@ -4,6 +4,7 @@ import json
 import math
 import os
 import tempfile
+from copy import deepcopy
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -295,7 +296,8 @@ def select_alignment_pilot(records: list[dict[str, Any]], config: dict[str, Any]
             continue
         selected.append(row)
         hours[language] += float(row["duration"]) / 3600
-    missing = [language for language in LANGUAGES if hours[language] == 0]
+    required = tuple(config["gate"]["required_alignment_languages"])
+    missing = [language for language in required if hours[language] == 0]
     if missing:
         raise RuntimeError(f"alignment pilot has no long unscripted audio for: {missing}")
     return selected
@@ -435,3 +437,18 @@ def run_alignment_pilot(
         "languages": {language: dict(values) for language, values in sorted(by_language.items())},
         "provisional_thresholds": True,
     }
+
+
+def run_full_alignment(
+    config: dict[str, Any], split_directory: Path, seed_directory: Path, output_directory: Path
+) -> dict[str, Any]:
+    """Align every eligible long recording in the prepared, leakage-safe corpus."""
+    full_config = deepcopy(config)
+    full_config["alignment"]["maximum_source_seconds"] = float(
+        config["full_alignment"]["maximum_source_seconds"]
+    )
+    full_config["alignment"]["pilot_hours"] = {language: float("inf") for language in LANGUAGES}
+    result = run_alignment_pilot(full_config, split_directory, seed_directory, output_directory)
+    result["scope"] = "all_eligible_records_in_prepared_manifest"
+    result["provisional_thresholds"] = False
+    return result

@@ -31,6 +31,10 @@ IMPLEMENTED_STAGES = (
     "seed-smoke",
     "train-seed",
     "align-pilot",
+    "alignment-gate",
+    "align-full",
+    "train-final",
+    "infer-test",
 )
 
 
@@ -241,6 +245,106 @@ def align_pilot(config: dict[str, Any]) -> None:
     print(json.dumps(result, indent=2))
 
 
+def alignment_gate(config: dict[str, Any]) -> None:
+    from round7.gate import run_alignment_gate
+
+    required = ("seed-smoke", "train-seed", "align-pilot")
+    for stage in required:
+        if not (stage_directory(config, stage) / "status.json").is_file():
+            raise RuntimeError(f"{stage} must complete before alignment-gate")
+    directory = stage_directory(config, "alignment-gate")
+    result = run_alignment_gate(
+        config,
+        stage_directory(config, "build-splits"),
+        stage_directory(config, "seed-smoke"),
+        stage_directory(config, "train-seed"),
+        stage_directory(config, "align-pilot"),
+        directory,
+    )
+    atomic_write_json(directory / "gate.json", result)
+    mark_complete(config, "alignment-gate", result)
+    print(json.dumps(result, indent=2))
+
+
+def _require_gate(config: dict[str, Any]) -> dict[str, Any]:
+    path = stage_directory(config, "alignment-gate") / "gate.json"
+    if not path.is_file():
+        raise RuntimeError("alignment-gate must complete first")
+    result = json.loads(path.read_text(encoding="utf-8"))
+    if not result.get("proceed"):
+        raise RuntimeError("alignment gate rejected aligned data: " + "; ".join(result["reasons"]))
+    return result
+
+
+def align_full(config: dict[str, Any]) -> None:
+    from round7.alignment import run_full_alignment
+
+    gate = _require_gate(config)
+    directory = stage_directory(config, "align-full")
+    result = run_full_alignment(
+        config,
+        stage_directory(config, "build-splits"),
+        stage_directory(config, "alignment-gate"),
+        directory,
+    )
+    result["gate_macro_wer_improvement"] = gate["macro_wer_improvement"]
+    atomic_write_json(directory / "report.json", result)
+    mark_complete(config, "align-full", result)
+    print(json.dumps(result, indent=2))
+
+
+def train_final(config: dict[str, Any]) -> None:
+    from round7.gate import select_lower_macro_candidate
+    from round7.training import train_seed_model
+
+    gate = _require_gate(config)
+    aligned = stage_directory(config, "align-full") / "accepted.jsonl"
+    if not aligned.is_file():
+        raise RuntimeError("align-full must complete before train-final")
+    directory = stage_directory(config, "train-final")
+    result = train_seed_model(
+        config,
+        stage_directory(config, "build-splits"),
+        stage_directory(config, "seed-smoke"),
+        directory,
+        additional_train_manifest=aligned,
+        maximum_steps_override=int(config["final_training"]["maximum_steps"]),
+        evaluation_steps_override=int(config["final_training"]["evaluation_steps"]),
+        initial_checkpoint_override=Path(_require_gate(config)["aligned_checkpoint"]),
+    )
+    final_pointer = json.loads(
+        (directory / "checkpoints" / "best.json").read_text(encoding="utf-8")
+    )
+    selected = select_lower_macro_candidate(
+        {
+            "name": "gated_pilot",
+            "checkpoint": gate["aligned_checkpoint"],
+            "metrics": {"macro_wer": gate["aligned_macro_wer"]},
+        },
+        {
+            "name": "full_aligned",
+            "checkpoint": final_pointer["checkpoint"],
+            "metrics": final_pointer["metrics"],
+        },
+    )
+    result["inference_selection"] = selected
+    atomic_write_json(directory / "result.json", result)
+    mark_complete(config, "train-final", result)
+    print(json.dumps(result, indent=2))
+
+
+def infer_test(config: dict[str, Any]) -> None:
+    from round7.inference import run_test_inference
+
+    if not (stage_directory(config, "train-final") / "status.json").is_file():
+        raise RuntimeError("train-final must complete before infer-test")
+    directory = stage_directory(config, "infer-test")
+    result = run_test_inference(config, stage_directory(config, "train-final"), directory)
+    atomic_write_json(directory / "report.json", result)
+    mark_complete(config, "infer-test", result)
+    print(json.dumps(result, indent=2))
+
+
 def is_complete(config: dict[str, Any], stage: str) -> bool:
     if stage == "preflight":
         return False
@@ -251,15 +355,26 @@ def is_complete(config: dict[str, Any], stage: str) -> bool:
         complete = json.loads(status.read_text(encoding="utf-8")).get("status") == "complete"
         if not complete:
             return False
-        if stage in {"prepare-sources", "build-splits", "align-pilot"}:
+        if stage in {"prepare-sources", "build-splits", "align-pilot", "align-full"}:
             from round7.sources import manifest_audio_complete
 
             manifests = {
                 "prepare-sources": Path(config["paths"]["source_manifest"]),
                 "build-splits": stage_directory(config, "build-splits") / "manifest.jsonl",
                 "align-pilot": stage_directory(config, "align-pilot") / "accepted.jsonl",
+                "align-full": stage_directory(config, "align-full") / "accepted.jsonl",
             }
             return manifest_audio_complete(manifests[stage])
+        if stage == "seed-smoke":
+            return (stage_directory(config, stage) / "checkpoint" / "config.json").is_file()
+        if stage in {"train-seed", "alignment-gate", "train-final"}:
+            pointer = stage_directory(config, stage) / "checkpoints" / "best.json"
+            if not pointer.is_file():
+                return False
+            checkpoint = Path(json.loads(pointer.read_text(encoding="utf-8"))["checkpoint"])
+            return (checkpoint / "config.json").is_file() and (checkpoint / "model.safetensors").is_file()
+        if stage == "infer-test":
+            return (stage_directory(config, stage) / "submission_round7_xlsr_greedy.csv").is_file()
         return True
     except (OSError, json.JSONDecodeError):
         return False
@@ -283,6 +398,14 @@ def run_stage(
         train_seed(config)
     elif stage == "align-pilot":
         align_pilot(config)
+    elif stage == "alignment-gate":
+        alignment_gate(config)
+    elif stage == "align-full":
+        align_full(config)
+    elif stage == "train-final":
+        train_final(config)
+    elif stage == "infer-test":
+        infer_test(config)
     else:
         raise ValueError(f"stage is not implemented: {stage}")
 

@@ -30,10 +30,19 @@ tested stages are exposed by the command-line interface.
    One atomic result is saved per source recording, so interrupted alignment
    resumes without repeating completed sources. Stale scratch-audio references
    invalidate stage completion automatically.
+7. `alignment-gate`: trains a clean-plus-pilot candidate from the same smoke
+   checkpoint and validation split as the clean baseline. Coverage, macro WER,
+   language breadth, and maximum regression determine whether work proceeds.
+8. `align-full`: uses the gated candidate to align every eligible long recording
+   in the prepared manifest, with the same per-record recovery.
+9. `train-final`: initializes from the gated checkpoint and trains on clean plus
+   all accepted aligned segments, selecting by macro language WER.
+10. `infer-test`: runs resumable language-conditioned greedy CTC inference and
+    refuses to produce an incomplete submission or hide failed audio rows.
 
-The pilot comparison gate, final aligned-data training, ONNX export, edge
-benchmark, and test inference remain unavailable until their smoke tests are
-implemented.
+ONNX export, int8 quantization, and edge RAM/RTF benchmarking are intentionally
+deferred until a final checkpoint exists. Optional language-model decoding is
+also outside the critical training-to-submission path.
 
 ## Input manifest
 
@@ -63,6 +72,10 @@ python3 -m round7.pipeline --stage build-splits
 python3 -m round7.pipeline --stage seed-smoke
 python3 -m round7.pipeline --stage train-seed
 python3 -m round7.pipeline --stage align-pilot
+python3 -m round7.pipeline --stage alignment-gate
+python3 -m round7.pipeline --stage align-full
+python3 -m round7.pipeline --stage train-final
+python3 -m round7.pipeline --stage infer-test
 ```
 
 Completed stages are skipped. Pass `--force` to rerun one. Outputs are written

@@ -376,6 +376,10 @@ def train_seed_model(
     split_directory: Path,
     smoke_directory: Path,
     output_directory: Path,
+    additional_train_manifest: Path | None = None,
+    maximum_steps_override: int | None = None,
+    evaluation_steps_override: int | None = None,
+    initial_checkpoint_override: Path | None = None,
 ) -> dict[str, Any]:
     if not torch.cuda.is_available():
         raise RuntimeError("seed training requires CUDA")
@@ -390,6 +394,13 @@ def train_seed_model(
     maximum_duration = float(config["data"]["seed_max_duration"])
     train_records = select_seed_records(records, "train", maximum_duration)
     eval_records = select_seed_records(records, "validation", maximum_duration)
+    additional_records = []
+    if additional_train_manifest is not None:
+        additional_records = read_jsonl(additional_train_manifest)
+        invalid = [row["id"] for row in additional_records if row.get("split") != "train"]
+        if invalid:
+            raise RuntimeError("additional training manifest contains non-train records")
+        train_records.extend(additional_records)
     if not train_records or not eval_records:
         raise RuntimeError("seed train and validation records are required")
 
@@ -415,15 +426,15 @@ def train_seed_model(
         persistent_workers=workers > 0,
     )
 
-    maximum_steps = int(config["training"]["seed_max_steps"])
-    eval_steps = int(config["training"]["seed_eval_steps"])
+    maximum_steps = int(maximum_steps_override or config["training"]["seed_max_steps"])
+    eval_steps = int(evaluation_steps_override or config["training"]["seed_eval_steps"])
     warmup_steps = max(1, round(maximum_steps * float(config["training"]["warmup_ratio"])))
     unfreeze_step = max(
         1, round(maximum_steps * float(config["training"]["feature_encoder_freeze_ratio"]))
     )
     checkpoint_root = output_directory / "checkpoints"
     resume = _latest_checkpoint(checkpoint_root)
-    initial = resume or smoke_directory / "checkpoint"
+    initial = resume or initial_checkpoint_override or smoke_directory / "checkpoint"
     model = LanguageConditionedXLSRForCTC.from_pretrained(initial).to(device)
     if config["training"].get("gradient_checkpointing", True):
         model.gradient_checkpointing_enable()
@@ -557,5 +568,6 @@ def train_seed_model(
         "best_macro_wer": best_wer,
         "best_checkpoint": best_checkpoint,
         "train_records": len(train_records),
+        "additional_train_records": len(additional_records),
         "eval_records": len(eval_records),
     }

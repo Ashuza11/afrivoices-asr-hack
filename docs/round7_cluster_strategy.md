@@ -220,8 +220,12 @@ the cluster does not have to edit notebooks:
 14. `infer-test`: run only after validation and edge gates pass; write resumable
     raw and normalized submissions.
 
-The repository currently implements stages 1-6 only. Stages 7-14 are the
-remaining competition pipeline and must not be represented as executable yet.
+The repository implements stages 1-7, stage 8 over every eligible recording in
+the prepared pilot manifest, stage 10 final training, and stage 14 greedy test
+inference. Expanding preparation to every source-repository shard, optional LM
+decoding, ONNX export, and edge benchmarking remain separate work. The prepared
+manifest scope must be reported accurately; `align-full` does not imply that
+all approximately 3,000 source hours were downloaded.
 
 All stages must be restartable. Hex has no separate scratch filesystem, so
 manifests, extracted audio, checkpoints, metrics, and logs are kept under the
